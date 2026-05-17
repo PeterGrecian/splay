@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""splay — still-image viewer with selection, wipe, and a thumbnail strip.
+
+Usage:
+    splay <files...>            # explicit list
+    splay <dir>                 # all images in dir (recursive=no)
+    splay                       # all images in cwd
+
+Keys:
+    ← →         previous / next frame (in current mode's scope)
+    s           select current frame
+    d           deselect current frame
+    l           toggle list mode (all frames) / selected mode (only selected)
+    w           toggle wipe between the two most recently displayed frames;
+                while on, mouse X positions the vertical wipe boundary
+    f           toggle fullscreen
+    h           toggle HUD / help overlay
+    click       print BGR + HSV at clicked pixel (relative to the underlying image)
+    q / Esc     quit (selection list printed on exit)
+
+Images are auto-fit to the window, aspect-ratio preserved.
+"""
+
+import argparse, pathlib, sys
+import pygame
+import colorsys
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
+THUMB_H = 80
+HUD_BG = (0, 0, 0, 180)
+
+
+def gather_paths(args):
+    if not args:
+        args = ["."]
+    out = []
+    for a in args:
+        p = pathlib.Path(a)
+        if p.is_dir():
+            out.extend(sorted(x for x in p.iterdir()
+                              if x.suffix.lower() in IMG_EXTS))
+        elif p.is_file():
+            out.append(p)
+        else:
+            print(f"skip: {p} not found", file=sys.stderr)
+    return out
+
+
+def fit_into(img_w, img_h, box_w, box_h):
+    """Return (w, h) for the image scaled to fit inside box, aspect preserved."""
+    if img_w == 0 or img_h == 0:
+        return box_w, box_h
+    s = min(box_w / img_w, box_h / img_h)
+    return max(1, int(img_w * s)), max(1, int(img_h * s))
+
+
+class Splay:
+    def __init__(self, paths):
+        if not paths:
+            sys.exit("no images")
+        self.paths = paths
+        self.images = {}     # path -> pygame.Surface (lazy loaded)
+        self.thumbs = {}     # path -> small Surface for the strip
+        self.selected = set()
+        self.list_mode = True       # if False, navigate only over selected
+        self.idx = 0                # index into current scope
+        self.prev_path = None       # for wipe: the previously displayed frame
+        self.curr_path = None
+        self.wipe_on = False
+        self.wipe_x = None          # current wipe boundary in screen coords
+        self.show_hud = False
+        self.show_strip = True
+        self.fullscreen = False
+        self.click_info = None      # (x, y, bgr, hsv) of last click
+        pygame.init()
+        pygame.display.set_caption("splay")
+        info = pygame.display.Info()
+        self.window_w, self.window_h = int(info.current_w * 0.8), int(info.current_h * 0.8)
+        self.screen = pygame.display.set_mode((self.window_w, self.window_h),
+                                              pygame.RESIZABLE)
+        self.font = pygame.font.SysFont("monospace", 14)
+        self.font_big = pygame.font.SysFont("monospace", 16)
+        self._load_thumbs()
+        self._show_current()
+
+    # ---- scope helpers ----
+    def scope(self):
+        if self.list_mode:
+            return self.paths
+        return [p for p in self.paths if p in self.selected]
+
+    def current(self):
+        sc = self.scope()
+        if not sc:
+            return None
+        self.idx = max(0, min(self.idx, len(sc) - 1))
+        return sc[self.idx]
+
+    # ---- image loading ----
+    def load(self, path):
+        if path not in self.images:
+            try:
+                self.images[path] = pygame.image.load(str(path)).convert()
+            except Exception as e:
+                print(f"failed to load {path}: {e}", file=sys.stderr)
+                return None
+        return self.images[path]
+
+    def _load_thumbs(self):
+        # Cheap: load lazily as the strip needs them.
+        pass
+
+    def thumb(self, path):
+        if path not in self.thumbs:
+            img = self.load(path)
+            if img is None:
+                return None
+            w, h = img.get_size()
+            tw, th = fit_into(w, h, THUMB_H * 2, THUMB_H)
+            self.thumbs[path] = pygame.transform.smoothscale(img, (tw, th))
+        return self.thumbs[path]
+
+    # ---- navigation ----
+    def _show_current(self):
+        cur = self.current()
+        if cur is None:
+            self.curr_path = None
+            return
+        if cur != self.curr_path:
+            self.prev_path = self.curr_path
+            self.curr_path = cur
+
+    def next(self, delta):
+        sc = self.scope()
+        if not sc:
+            return
+        self.idx = (self.idx + delta) % len(sc)
+        self._show_current()
+
+    def select(self):
+        if self.curr_path:
+            self.selected.add(self.curr_path)
+
+    def deselect(self):
+        if self.curr_path:
+            self.selected.discard(self.curr_path)
+            # If we were in selected mode and removed the current, advance.
+            if not self.list_mode and self.curr_path not in self.scope():
+                self.idx = min(self.idx, max(0, len(self.scope()) - 1))
+                self._show_current()
+
+    def toggle_list(self):
+        # Preserve the current frame's index in the new scope where possible.
+        cur = self.curr_path
+        self.list_mode = not self.list_mode
+        sc = self.scope()
+        if cur and cur in sc:
+            self.idx = sc.index(cur)
+        else:
+            self.idx = 0
+        self._show_current()
+
+    def toggle_wipe(self, mouse_x):
+        self.wipe_on = not self.wipe_on
+        if self.wipe_on:
+            self.wipe_x = mouse_x
+
+    # ---- compute image render rect (fit to display area, above strip) ----
+    def display_area(self):
+        ww, wh = self.screen.get_size()
+        strip_h = THUMB_H + 24 if self.show_strip else 0
+        return pygame.Rect(0, 0, ww, max(1, wh - strip_h))
+
+    def image_blit_rect(self, surf):
+        area = self.display_area()
+        w, h = fit_into(surf.get_width(), surf.get_height(), area.w, area.h)
+        x = area.x + (area.w - w) // 2
+        y = area.y + (area.h - h) // 2
+        return pygame.Rect(x, y, w, h)
+
+    # ---- drawing ----
+    def draw(self):
+        self.screen.fill((20, 20, 20))
+        cur = self.curr_path
+        cur_surf = self.load(cur) if cur else None
+        if cur_surf is None:
+            self._draw_text((10, 10), "no image", colour=(220, 100, 100))
+        else:
+            target = self.image_blit_rect(cur_surf)
+            scaled = pygame.transform.smoothscale(cur_surf, target.size)
+            if self.wipe_on and self.prev_path and self.prev_path != cur:
+                prev_surf = self.load(self.prev_path)
+                if prev_surf is not None:
+                    prev_scaled = pygame.transform.smoothscale(prev_surf, target.size)
+                    # Wipe boundary x is in screen coords; convert to within target.
+                    bx = self.wipe_x if self.wipe_x is not None else target.x + target.w // 2
+                    bx_local = max(0, min(target.w, bx - target.x))
+                    # Left half = previous, right half = current.
+                    self.screen.blit(prev_scaled, target.topleft,
+                                     area=pygame.Rect(0, 0, bx_local, target.h))
+                    self.screen.blit(scaled, (target.x + bx_local, target.y),
+                                     area=pygame.Rect(bx_local, 0,
+                                                      target.w - bx_local, target.h))
+                    # Boundary line
+                    pygame.draw.line(self.screen, (255, 200, 0),
+                                     (target.x + bx_local, target.y),
+                                     (target.x + bx_local, target.y + target.h), 2)
+                else:
+                    self.screen.blit(scaled, target.topleft)
+            else:
+                self.screen.blit(scaled, target.topleft)
+
+        if self.show_strip:
+            self._draw_strip()
+        self._draw_status()
+        if self.show_hud:
+            self._draw_hud()
+        if self.click_info:
+            self._draw_click_info()
+        pygame.display.flip()
+
+    def _draw_text(self, pos, text, colour=(220, 220, 220), font=None):
+        f = font or self.font
+        surf = f.render(text, True, colour)
+        self.screen.blit(surf, pos)
+
+    def _draw_status(self):
+        sc = self.scope()
+        n = len(sc)
+        mode = "LIST" if self.list_mode else "SEL "
+        name = self.curr_path.name if self.curr_path else "—"
+        sel_mark = " ★" if self.curr_path in self.selected else "  "
+        msg = (f"{mode}  [{self.idx+1}/{n}]  {name}{sel_mark}"
+               f"  selected:{len(self.selected)}"
+               + ("  WIPE" if self.wipe_on else ""))
+        # Top status bar with translucent background.
+        ww = self.screen.get_width()
+        bar = pygame.Surface((ww, 22), pygame.SRCALPHA)
+        bar.fill((0, 0, 0, 140))
+        self.screen.blit(bar, (0, 0))
+        self._draw_text((6, 3), msg, colour=(230, 230, 230))
+
+    def _draw_strip(self):
+        ww, wh = self.screen.get_size()
+        strip_y = wh - THUMB_H - 24
+        # Background
+        bar = pygame.Surface((ww, THUMB_H + 24), pygame.SRCALPHA)
+        bar.fill((0, 0, 0, 160))
+        self.screen.blit(bar, (0, strip_y))
+
+        sc = self.scope()
+        if not sc:
+            return
+        # Centre on current; clip to window.
+        thumbs = []
+        widths = []
+        for p in sc:
+            t = self.thumb(p)
+            thumbs.append(t)
+            widths.append(t.get_width() + 8 if t else 0)
+        if self.idx < len(widths):
+            # Compute x so current is centred.
+            x0_of_current = sum(widths[:self.idx]) + widths[self.idx] // 2
+            offset_x = ww // 2 - x0_of_current
+        else:
+            offset_x = 0
+
+        x = offset_x
+        y = strip_y + 4
+        for i, (p, t) in enumerate(zip(sc, thumbs)):
+            if t is None:
+                continue
+            tw = t.get_width()
+            if x + tw < 0 or x > ww:
+                x += tw + 8
+                continue
+            self.screen.blit(t, (x, y))
+            if i == self.idx:
+                pygame.draw.rect(self.screen, (255, 200, 0),
+                                 (x - 2, y - 2, tw + 4, t.get_height() + 4), 2)
+            if p in self.selected:
+                pygame.draw.rect(self.screen, (100, 220, 100),
+                                 (x + tw - 12, y + 2, 10, 10))
+            # name underneath, truncated
+            name = p.name
+            if len(name) > 16:
+                name = name[:14] + "…"
+            self._draw_text((x, y + t.get_height() + 2), name)
+            x += tw + 8
+
+    def _draw_hud(self):
+        lines = [
+            "splay — image viewer",
+            "",
+            "← →   prev / next",
+            "s     select current",
+            "d     deselect current",
+            "l     toggle list / selected mode",
+            "w     toggle wipe between last 2 frames",
+            "f     toggle fullscreen",
+            "h     toggle this help",
+            "click pixel-pick (BGR + HSV)",
+            "q     quit",
+        ]
+        pad = 14
+        line_h = 20
+        box_w = 360
+        box_h = pad * 2 + line_h * len(lines)
+        ww, wh = self.screen.get_size()
+        bx = ww - box_w - 20
+        by = 40
+        s = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        s.fill((0, 0, 0, 200))
+        self.screen.blit(s, (bx, by))
+        for i, line in enumerate(lines):
+            self._draw_text((bx + pad, by + pad + i * line_h), line,
+                            font=self.font_big)
+
+    def _draw_click_info(self):
+        x, y, bgr, hsv = self.click_info
+        b, g, r = bgr
+        h, s, v = hsv
+        msg = (f"({x},{y})  RGB={r:3d},{g:3d},{b:3d}  "
+               f"HSV={int(h*180):3d},{int(s*255):3d},{int(v*255):3d}")
+        bar = pygame.Surface((640, 22), pygame.SRCALPHA)
+        bar.fill((0, 0, 0, 200))
+        self.screen.blit(bar, (6, 28))
+        self._draw_text((10, 31), msg, colour=(255, 220, 100))
+
+    # ---- input ----
+    def on_click(self, screen_pos):
+        cur = self.curr_path
+        if not cur:
+            return
+        surf = self.load(cur)
+        if surf is None:
+            return
+        target = self.image_blit_rect(surf)
+        sx, sy = screen_pos
+        if not target.collidepoint(sx, sy):
+            return
+        # Map screen → image coords.
+        u = (sx - target.x) / target.w
+        v = (sy - target.y) / target.h
+        iw, ih = surf.get_size()
+        ix = max(0, min(iw - 1, int(u * iw)))
+        iy = max(0, min(ih - 1, int(v * ih)))
+        col = surf.get_at((ix, iy))  # RGBA
+        r, g, b = col.r, col.g, col.b
+        hh, ss, vv = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        bgr = (b, g, r)
+        self.click_info = (ix, iy, bgr, (hh, ss, vv))
+        print(f"  ({ix},{iy})  RGB=({r},{g},{b})  "
+              f"HSV=({int(hh*180)},{int(ss*255)},{int(vv*255)})")
+
+    def run(self):
+        running = True
+        clock = pygame.time.Clock()
+        while running:
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    running = False
+                elif ev.type == pygame.VIDEORESIZE:
+                    self.screen = pygame.display.set_mode(
+                        (ev.w, ev.h), pygame.RESIZABLE)
+                elif ev.type == pygame.MOUSEMOTION and self.wipe_on:
+                    self.wipe_x = ev.pos[0]
+                elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                    if not self.wipe_on:
+                        self.on_click(ev.pos)
+                elif ev.type == pygame.KEYDOWN:
+                    k = ev.key
+                    if k in (pygame.K_q, pygame.K_ESCAPE):
+                        running = False
+                    elif k == pygame.K_RIGHT:
+                        self.next(+1)
+                    elif k == pygame.K_LEFT:
+                        self.next(-1)
+                    elif k == pygame.K_s:
+                        self.select()
+                    elif k == pygame.K_d:
+                        self.deselect()
+                    elif k == pygame.K_l:
+                        self.toggle_list()
+                    elif k == pygame.K_w:
+                        mx, _ = pygame.mouse.get_pos()
+                        self.toggle_wipe(mx)
+                    elif k == pygame.K_h:
+                        self.show_hud = not self.show_hud
+                    elif k == pygame.K_f:
+                        self.fullscreen = not self.fullscreen
+                        flags = pygame.FULLSCREEN if self.fullscreen else pygame.RESIZABLE
+                        self.screen = pygame.display.set_mode((0, 0) if self.fullscreen
+                                                              else (self.window_w,
+                                                                    self.window_h),
+                                                              flags)
+            self.draw()
+            clock.tick(60)
+        pygame.quit()
+        if self.selected:
+            print("\nselected:")
+            for p in self.paths:
+                if p in self.selected:
+                    print(f"  {p}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="still-image viewer with wipe + selection")
+    ap.add_argument("paths", nargs="*",
+                    help="image files or directories (default: cwd)")
+    args = ap.parse_args()
+    paths = gather_paths(args.paths)
+    if not paths:
+        sys.exit("no images found")
+    print(f"loaded {len(paths)} image(s). h = help.")
+    Splay(paths).run()
+
+
+if __name__ == "__main__":
+    main()
