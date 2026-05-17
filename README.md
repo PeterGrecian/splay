@@ -1,50 +1,43 @@
-# splay / vplay
+# splay
 
-Desktop frame players for stills and video — keyboard-driven, wipe-comparable,
-selection-aware.
+Keyboard-driven still-image viewer with selection, wipe, thumbnail strip, and
+per-pixel RGB/HSV pickoff. Built for fast iteration on image-processing
+algorithms where you need to flip rapidly between input and output to judge
+the change.
 
 ## Lineage
 
-Descendants of `play`, a utility I wrote at **The Moving Picture Company in
+Descendant of `play`, a utility I wrote at **The Moving Picture Company in
 1996** for SGI IRIX, ported to Linux in 2001. The original handled image
 sequences — the natural unit of work in film post-production at the time.
 
-This repo brings the same idea back because modern tooling still doesn't quite
-scratch the same itch: a fast viewer for stepping through frames, selecting
-them for downstream work, wiping between pairs to compare A/B, treating an
-image sequence (or a video) as the first-class object it is.
+The name `play` was too generic for a modern PATH (it collides with SoX
+among other things), so this rewrite keeps the original capability under its
+natural pun: **splay** for stills. A sibling **vplay** for video is planned
+as its own repo; the two will share an interaction model but remain separate
+executables.
 
-The name `play` was too generic (and collides with SoX), so the modern split
-keeps both halves of the original capability under their natural puns:
-**splay** for stills, **vplay** for video.
+## What it does
 
-## Current contents
+- Step through a directory or explicit list of images with the arrow keys.
+- Select/deselect frames; toggle between viewing all frames and viewing only
+  the selected ones.
+- Wipe between the two most recently shown frames — useful A/B comparison
+  for before/after.
+- Pixel-pick: click a pixel and read its BGR/RGB + HSV in both the on-screen
+  HUD and the terminal. Useful for picking thresholds in image-processing
+  pipelines.
+- Thumbnail strip with names. Selection state shown.
+- Fullscreen and a HUD help overlay.
 
-- **`splay`** — still-image viewer (Python + pygame). Handles a directory or
-  explicit list of images. Selection, wipe, thumbnail strip, pixel-pick
-  (RGB + HSV), fullscreen, HUD. Used heavily for tuning image-processing
-  algorithms where you need to flip between input and output to see the change.
-
-- **`vplay`** — *(planned)* desktop video frame viewer. Sibling to `splay`,
-  sharing its interaction model. Not the same as the separate `~/vplay` web
-  repo (browser-based player extracted from mywebsite's skycam viewer) — that
-  one is a different lineage.
-
-## Status
-
-`splay` is functional. The interaction model (hotkeys, selection semantics,
-wipe behaviour, thumbnail strip) is the shared design `vplay` will inherit
-when it lands. The two will remain separate executables — no unifying
-wrapper.
-
-## Hotkeys (splay)
+## Hotkeys
 
 | Key | Action |
 |---|---|
 | ← → | previous / next frame |
 | s | select current frame |
 | d | deselect current frame |
-| l | toggle list mode (all) / selected-only mode |
+| l | toggle list mode (all frames) / selected-only mode |
 | w | toggle wipe between the two most recently shown frames; mouse X positions the boundary |
 | f | toggle fullscreen |
 | h | toggle HUD / help |
@@ -54,7 +47,18 @@ wrapper.
 ## Install
 
 ```
-cd ~/play
-pip install --user pygame    # or use a venv
-ln -s $PWD/splay ~/super/bin/splay    # or however your $PATH is set up
+git clone <repo-url> ~/splay
+pip install --user pygame      # or use a venv
+ln -s ~/splay/splay ~/bin/splay   # or wherever your $PATH points
 ```
+
+## Usage
+
+```
+splay                     # all images in cwd
+splay <dir>               # all images in dir (non-recursive)
+splay a.png b.png c.png   # explicit list
+```
+
+Supported formats: anything pygame can decode (PNG, JPG, BMP, GIF, TIFF,
+WebP).
