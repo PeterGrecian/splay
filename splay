@@ -1,33 +1,48 @@
 #!/usr/bin/env python3
-"""splay — still-image viewer with selection, wipe, and a thumbnail strip.
+"""splay — still-image viewer with selection, wipe, thumbnail strip, and
+optional image-processing apps loaded from ~/splay/apps/ and ~/.config/splay/apps/.
 
 Usage:
-    splay <files...>            # explicit list
-    splay <dir>                 # all images in dir (recursive=no)
-    splay                       # all images in cwd
+    splay <files...>              # explicit list
+    splay <dir>                   # all images in dir (recursive=no)
+    splay                         # all images in cwd
+    splay --app <name> <files>    # load an image-processing app
 
-Keys:
-    ← →         previous / next frame (in current mode's scope)
+Keys (always):
+    ← →         previous / next frame
     s           select current frame
     d           deselect current frame
-    l           toggle list mode (all frames) / selected mode (only selected)
-    w           toggle wipe between the two most recently displayed frames;
-                while on, mouse X positions the vertical wipe boundary
+    l           toggle list mode / selected-only mode
+    w           toggle wipe between two most recently shown frames
     f           toggle fullscreen
-    h           toggle HUD / help overlay
-    click       print BGR + HSV at clicked pixel (relative to the underlying image)
-    q / Esc     quit (selection list printed on exit)
+    h           toggle HUD / help
+    click       pixel-pick (BGR + HSV); in app mode, also nudges thresholds
+    q / Esc     quit
 
-Images are auto-fit to the window, aspect-ratio preserved.
+Keys (in --app mode):
+    o           cycle view: input / wipe / output / mask
+    , .         cycle which app parameter is active
+    [ ]         decrement / increment active parameter by step
+    { }         decrement / increment by 10× step
+    0           reset active parameter to default
+    Shift+0     reset all parameters to defaults
+    z / Z       undo / redo a parameter change (clicks + key adjustments)
+    Ctrl+R      open render-now dialog with current parameters
 """
 
-import argparse, pathlib, sys
+import argparse, importlib.util, os, pathlib, sys, copy
 import pygame
 import colorsys
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
 THUMB_H = 80
-HUD_BG = (0, 0, 0, 180)
+
+VIEW_INPUT = 0
+VIEW_WIPE = 1
+VIEW_OUTPUT = 2
+VIEW_MASK = 3
+VIEW_NAMES = {VIEW_INPUT: "input", VIEW_WIPE: "wipe",
+              VIEW_OUTPUT: "output", VIEW_MASK: "mask"}
 
 
 def gather_paths(args):
@@ -47,43 +62,115 @@ def gather_paths(args):
 
 
 def fit_into(img_w, img_h, box_w, box_h):
-    """Return (w, h) for the image scaled to fit inside box, aspect preserved."""
     if img_w == 0 or img_h == 0:
         return box_w, box_h
     s = min(box_w / img_w, box_h / img_h)
     return max(1, int(img_w * s)), max(1, int(img_h * s))
 
 
+# ---- app loader --------------------------------------------------------------
+
+APP_DIRS = [
+    pathlib.Path(__file__).resolve().parent / "apps",            # in-repo
+    pathlib.Path.home() / ".config" / "splay" / "apps",          # user
+]
+
+
+def load_app(name):
+    """Load app module by name. In-repo wins over user dir."""
+    for d in APP_DIRS:
+        f = d / f"{name}.py"
+        if f.is_file():
+            spec = importlib.util.spec_from_file_location(f"splay_app_{name}", f)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            # Initialise defaults from PARAMS.
+            mod._defaults = {k: v[2] for k, v in getattr(mod, "PARAMS", {}).items()}
+            return mod
+    raise SystemExit(f"app not found: {name}  (searched: {[str(d) for d in APP_DIRS]})")
+
+
+def list_apps():
+    seen = set()
+    for d in APP_DIRS:
+        if not d.is_dir(): continue
+        for f in sorted(d.glob("*.py")):
+            if f.stem.startswith("_"): continue
+            if f.stem in seen: continue
+            seen.add(f.stem)
+            print(f"  {f.stem:20s} {f}")
+
+
+# ---- numpy/cv2 bridge --------------------------------------------------------
+# Only import these when an app is loaded (splay still works without them).
+
+_np = None
+_cv2 = None
+def _ensure_np_cv2():
+    global _np, _cv2
+    if _np is None:
+        import numpy as _n; _np = _n
+    if _cv2 is None:
+        import cv2 as _c; _cv2 = _c
+    return _np, _cv2
+
+def surface_to_bgr(surf):
+    """pygame Surface → BGR numpy uint8 array."""
+    np, cv2 = _ensure_np_cv2()
+    arr = pygame.surfarray.array3d(surf)  # (W, H, 3) RGB
+    arr = np.transpose(arr, (1, 0, 2))    # (H, W, 3)
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+def bgr_to_surface(bgr):
+    """BGR numpy uint8 array → pygame Surface."""
+    np, cv2 = _ensure_np_cv2()
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    arr = np.transpose(rgb, (1, 0, 2))  # (W, H, 3)
+    return pygame.surfarray.make_surface(arr)
+
+
+# ---- main viewer -------------------------------------------------------------
+
 class Splay:
-    def __init__(self, paths):
+    def __init__(self, paths, app=None):
         if not paths:
             sys.exit("no images")
         self.paths = paths
-        self.images = {}     # path -> pygame.Surface (lazy loaded)
-        self.thumbs = {}     # path -> small Surface for the strip
+        self.images = {}     # path -> pygame.Surface (lazy)
+        self.thumbs = {}
         self.selected = set()
-        self.list_mode = True       # if False, navigate only over selected
-        self.idx = 0                # index into current scope
-        self.prev_path = None       # for wipe: the previously displayed frame
+        self.list_mode = True
+        self.idx = 0
+        self.prev_path = None
         self.curr_path = None
         self.wipe_on = False
-        self.wipe_x = None          # current wipe boundary in screen coords
+        self.wipe_x = None
         self.show_hud = False
         self.show_strip = True
         self.fullscreen = False
-        self.click_info = None      # (x, y, bgr, hsv) of last click
+        self.click_info = None
+
+        # App state.
+        self.app = app
+        self.view = VIEW_OUTPUT if app else VIEW_INPUT
+        self.params = dict(app._defaults) if app else {}
+        self.param_keys = list(app.PARAMS.keys()) if app else []
+        self.active_param_idx = 0
+        self.undo_stack = []   # list of dicts (param snapshots)
+        self.redo_stack = []
+        self.processed_cache = {}  # (path, params-tuple, view) → Surface
+
         pygame.init()
-        pygame.display.set_caption("splay")
+        pygame.display.set_caption(f"splay{' — ' + app.NAME if app else ''}")
         info = pygame.display.Info()
         self.window_w, self.window_h = int(info.current_w * 0.8), int(info.current_h * 0.8)
         self.screen = pygame.display.set_mode((self.window_w, self.window_h),
                                               pygame.RESIZABLE)
         self.font = pygame.font.SysFont("monospace", 14)
         self.font_big = pygame.font.SysFont("monospace", 16)
-        self._load_thumbs()
         self._show_current()
 
-    # ---- scope helpers ----
+    # ---- scope ----
     def scope(self):
         if self.list_mode:
             return self.paths
@@ -91,12 +178,11 @@ class Splay:
 
     def current(self):
         sc = self.scope()
-        if not sc:
-            return None
+        if not sc: return None
         self.idx = max(0, min(self.idx, len(sc) - 1))
         return sc[self.idx]
 
-    # ---- image loading ----
+    # ---- images ----
     def load(self, path):
         if path not in self.images:
             try:
@@ -106,21 +192,50 @@ class Splay:
                 return None
         return self.images[path]
 
-    def _load_thumbs(self):
-        # Cheap: load lazily as the strip needs them.
-        pass
-
     def thumb(self, path):
         if path not in self.thumbs:
             img = self.load(path)
-            if img is None:
-                return None
+            if img is None: return None
             w, h = img.get_size()
             tw, th = fit_into(w, h, THUMB_H * 2, THUMB_H)
             self.thumbs[path] = pygame.transform.smoothscale(img, (tw, th))
         return self.thumbs[path]
 
-    # ---- navigation ----
+    # ---- processed (app output) ----
+    def _params_key(self):
+        return tuple(sorted(self.params.items()))
+
+    def processed(self, path, view_key):
+        """Return the app-processed Surface for path under current params.
+        view_key is 'output' or 'mask'."""
+        if not self.app: return None
+        key = (path, self._params_key(), view_key)
+        if key in self.processed_cache:
+            return self.processed_cache[key]
+        in_surf = self.load(path)
+        if in_surf is None: return None
+        bgr = surface_to_bgr(in_surf)
+        try:
+            if view_key == "output":
+                out = self.app.process(bgr, dict(self.params))
+            elif view_key == "mask" and hasattr(self.app, "mask"):
+                out = self.app.mask(bgr, dict(self.params))
+            else:
+                out = bgr  # fallback
+            surf = bgr_to_surface(out)
+        except Exception as e:
+            print(f"app error on {path.name}: {e}", file=sys.stderr)
+            return in_surf
+        # Bound cache: keep last 32 entries.
+        if len(self.processed_cache) > 32:
+            self.processed_cache.pop(next(iter(self.processed_cache)))
+        self.processed_cache[key] = surf
+        return surf
+
+    def _invalidate_processed(self):
+        self.processed_cache.clear()
+
+    # ---- nav ----
     def _show_current(self):
         cur = self.current()
         if cur is None:
@@ -132,40 +247,90 @@ class Splay:
 
     def next(self, delta):
         sc = self.scope()
-        if not sc:
-            return
+        if not sc: return
         self.idx = (self.idx + delta) % len(sc)
         self._show_current()
 
     def select(self):
-        if self.curr_path:
-            self.selected.add(self.curr_path)
+        if self.curr_path: self.selected.add(self.curr_path)
 
     def deselect(self):
-        if self.curr_path:
-            self.selected.discard(self.curr_path)
-            # If we were in selected mode and removed the current, advance.
-            if not self.list_mode and self.curr_path not in self.scope():
-                self.idx = min(self.idx, max(0, len(self.scope()) - 1))
-                self._show_current()
+        if not self.curr_path: return
+        self.selected.discard(self.curr_path)
+        if not self.list_mode and self.curr_path not in self.scope():
+            self.idx = min(self.idx, max(0, len(self.scope()) - 1))
+            self._show_current()
 
     def toggle_list(self):
-        # Preserve the current frame's index in the new scope where possible.
         cur = self.curr_path
         self.list_mode = not self.list_mode
         sc = self.scope()
-        if cur and cur in sc:
-            self.idx = sc.index(cur)
-        else:
-            self.idx = 0
+        if cur and cur in sc: self.idx = sc.index(cur)
+        else: self.idx = 0
         self._show_current()
 
     def toggle_wipe(self, mouse_x):
         self.wipe_on = not self.wipe_on
-        if self.wipe_on:
-            self.wipe_x = mouse_x
+        if self.wipe_on: self.wipe_x = mouse_x
 
-    # ---- compute image render rect (fit to display area, above strip) ----
+    def cycle_view(self, delta=1):
+        if not self.app: return
+        order = [VIEW_INPUT, VIEW_WIPE, VIEW_OUTPUT, VIEW_MASK]
+        # Skip MASK if app doesn't support it.
+        if not hasattr(self.app, "mask"):
+            order = [v for v in order if v != VIEW_MASK]
+        i = order.index(self.view) if self.view in order else 0
+        self.view = order[(i + delta) % len(order)]
+
+    # ---- app param management ----
+    def _push_undo(self):
+        self.undo_stack.append(dict(self.params))
+        if len(self.undo_stack) > 128:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def adjust_active_param(self, mult=1):
+        if not self.app or not self.param_keys: return
+        k = self.param_keys[self.active_param_idx]
+        spec = self.app.PARAMS[k]
+        lo, hi, _default, step, kind = spec
+        self._push_undo()
+        new = self.params[k] + step * mult
+        new = max(lo, min(hi, new))
+        if kind == "int": new = int(round(new))
+        self.params[k] = new
+        self._invalidate_processed()
+
+    def cycle_active_param(self, delta=1):
+        if not self.param_keys: return
+        self.active_param_idx = (self.active_param_idx + delta) % len(self.param_keys)
+
+    def reset_active_param(self):
+        if not self.app: return
+        k = self.param_keys[self.active_param_idx]
+        self._push_undo()
+        self.params[k] = self.app._defaults[k]
+        self._invalidate_processed()
+
+    def reset_all_params(self):
+        if not self.app: return
+        self._push_undo()
+        self.params = dict(self.app._defaults)
+        self._invalidate_processed()
+
+    def undo(self):
+        if not self.undo_stack: return
+        self.redo_stack.append(dict(self.params))
+        self.params = self.undo_stack.pop()
+        self._invalidate_processed()
+
+    def redo(self):
+        if not self.redo_stack: return
+        self.undo_stack.append(dict(self.params))
+        self.params = self.redo_stack.pop()
+        self._invalidate_processed()
+
+    # ---- layout ----
     def display_area(self):
         ww, wh = self.screen.get_size()
         strip_h = THUMB_H + 24 if self.show_strip else 0
@@ -178,46 +343,83 @@ class Splay:
         y = area.y + (area.h - h) // 2
         return pygame.Rect(x, y, w, h)
 
+    # ---- which surface to show? ----
+    def _surface_for_view(self):
+        if not self.curr_path: return None
+        in_surf = self.load(self.curr_path)
+        if in_surf is None: return None
+        if not self.app:
+            return in_surf
+        if self.view == VIEW_INPUT:  return in_surf
+        if self.view == VIEW_OUTPUT: return self.processed(self.curr_path, "output")
+        if self.view == VIEW_MASK:   return self.processed(self.curr_path, "mask")
+        if self.view == VIEW_WIPE:
+            return None  # handled specially in draw()
+        return in_surf
+
     # ---- drawing ----
     def draw(self):
         self.screen.fill((20, 20, 20))
-        cur = self.curr_path
-        cur_surf = self.load(cur) if cur else None
-        if cur_surf is None:
-            self._draw_text((10, 10), "no image", colour=(220, 100, 100))
+        if self.app and self.view == VIEW_WIPE:
+            self._draw_app_wipe()
+        elif self.wipe_on and self.prev_path and self.prev_path != self.curr_path and not self.app:
+            self._draw_pair_wipe()
         else:
-            target = self.image_blit_rect(cur_surf)
-            scaled = pygame.transform.smoothscale(cur_surf, target.size)
-            if self.wipe_on and self.prev_path and self.prev_path != cur:
-                prev_surf = self.load(self.prev_path)
-                if prev_surf is not None:
-                    prev_scaled = pygame.transform.smoothscale(prev_surf, target.size)
-                    # Wipe boundary x is in screen coords; convert to within target.
-                    bx = self.wipe_x if self.wipe_x is not None else target.x + target.w // 2
-                    bx_local = max(0, min(target.w, bx - target.x))
-                    # Left half = previous, right half = current.
-                    self.screen.blit(prev_scaled, target.topleft,
-                                     area=pygame.Rect(0, 0, bx_local, target.h))
-                    self.screen.blit(scaled, (target.x + bx_local, target.y),
-                                     area=pygame.Rect(bx_local, 0,
-                                                      target.w - bx_local, target.h))
-                    # Boundary line
-                    pygame.draw.line(self.screen, (255, 200, 0),
-                                     (target.x + bx_local, target.y),
-                                     (target.x + bx_local, target.y + target.h), 2)
-                else:
-                    self.screen.blit(scaled, target.topleft)
+            surf = self._surface_for_view()
+            if surf is None:
+                self._draw_text((10, 10), "no image", colour=(220, 100, 100))
             else:
+                target = self.image_blit_rect(surf)
+                scaled = pygame.transform.smoothscale(surf, target.size)
                 self.screen.blit(scaled, target.topleft)
 
-        if self.show_strip:
-            self._draw_strip()
+        if self.show_strip: self._draw_strip()
         self._draw_status()
-        if self.show_hud:
-            self._draw_hud()
-        if self.click_info:
-            self._draw_click_info()
+        if self.app: self._draw_params_panel()
+        if self.show_hud: self._draw_hud()
+        if self.click_info: self._draw_click_info()
         pygame.display.flip()
+
+    def _draw_pair_wipe(self):
+        cur_surf = self.load(self.curr_path)
+        prev_surf = self.load(self.prev_path)
+        if cur_surf is None or prev_surf is None: return
+        target = self.image_blit_rect(cur_surf)
+        cur_scaled = pygame.transform.smoothscale(cur_surf, target.size)
+        prev_scaled = pygame.transform.smoothscale(prev_surf, target.size)
+        bx = self.wipe_x if self.wipe_x is not None else target.x + target.w // 2
+        bx_local = max(0, min(target.w, bx - target.x))
+        self.screen.blit(prev_scaled, target.topleft,
+                         area=pygame.Rect(0, 0, bx_local, target.h))
+        self.screen.blit(cur_scaled, (target.x + bx_local, target.y),
+                         area=pygame.Rect(bx_local, 0, target.w - bx_local, target.h))
+        pygame.draw.line(self.screen, (255, 200, 0),
+                         (target.x + bx_local, target.y),
+                         (target.x + bx_local, target.y + target.h), 2)
+
+    def _draw_app_wipe(self):
+        """In app mode, VIEW_WIPE wipes between input and processed output of
+        the current frame (not between two frames)."""
+        in_surf = self.load(self.curr_path)
+        out_surf = self.processed(self.curr_path, "output")
+        if in_surf is None or out_surf is None: return
+        target = self.image_blit_rect(in_surf)
+        in_scaled = pygame.transform.smoothscale(in_surf, target.size)
+        out_scaled = pygame.transform.smoothscale(out_surf, target.size)
+        if self.wipe_x is None:
+            self.wipe_x = target.x + target.w // 2
+        bx_local = max(0, min(target.w, self.wipe_x - target.x))
+        self.screen.blit(in_scaled, target.topleft,
+                         area=pygame.Rect(0, 0, bx_local, target.h))
+        self.screen.blit(out_scaled, (target.x + bx_local, target.y),
+                         area=pygame.Rect(bx_local, 0, target.w - bx_local, target.h))
+        pygame.draw.line(self.screen, (255, 200, 0),
+                         (target.x + bx_local, target.y),
+                         (target.x + bx_local, target.y + target.h), 2)
+        # Labels.
+        self._draw_text((target.x + 6, target.y + 6), "INPUT", colour=(255, 220, 100))
+        self._draw_text((target.x + target.w - 60, target.y + 6), "OUTPUT",
+                        colour=(100, 255, 180))
 
     def _draw_text(self, pos, text, colour=(220, 220, 220), font=None):
         f = font or self.font
@@ -230,50 +432,67 @@ class Splay:
         mode = "LIST" if self.list_mode else "SEL "
         name = self.curr_path.name if self.curr_path else "—"
         sel_mark = " ★" if self.curr_path in self.selected else "  "
-        msg = (f"{mode}  [{self.idx+1}/{n}]  {name}{sel_mark}"
-               f"  selected:{len(self.selected)}"
-               + ("  WIPE" if self.wipe_on else ""))
-        # Top status bar with translucent background.
+        bits = [f"{mode}  [{self.idx+1}/{n}]  {name}{sel_mark}",
+                f"selected:{len(self.selected)}"]
+        if self.wipe_on and not self.app: bits.append("WIPE")
+        if self.app:
+            bits.append(f"app:{self.app.NAME}  view:{VIEW_NAMES[self.view]}")
+        msg = "  ".join(bits)
         ww = self.screen.get_width()
         bar = pygame.Surface((ww, 22), pygame.SRCALPHA)
         bar.fill((0, 0, 0, 140))
         self.screen.blit(bar, (0, 0))
         self._draw_text((6, 3), msg, colour=(230, 230, 230))
 
+    def _draw_params_panel(self):
+        if not self.param_keys: return
+        ww, wh = self.screen.get_size()
+        pad = 8
+        line_h = 18
+        box_w = 280
+        box_h = pad * 2 + line_h * (len(self.param_keys) + 1)
+        bx = 6
+        by = 30
+        s = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        s.fill((0, 0, 0, 180))
+        self.screen.blit(s, (bx, by))
+        self._draw_text((bx + pad, by + pad), f"PARAMS  (z/Z undo {len(self.undo_stack)}/{len(self.redo_stack)})",
+                        colour=(180, 180, 230))
+        for i, k in enumerate(self.param_keys):
+            spec = self.app.PARAMS[k]
+            v = self.params[k]
+            default = self.app._defaults[k]
+            modmark = "*" if v != default else " "
+            label = f"{modmark} {k:14s} {self._fmt_value(v, spec)}"
+            colour = (255, 220, 100) if i == self.active_param_idx else (220, 220, 220)
+            self._draw_text((bx + pad, by + pad + (i + 1) * line_h),
+                            label, colour=colour)
+
+    def _fmt_value(self, v, spec):
+        lo, hi, _d, _step, kind = spec
+        if kind == "int":
+            return f"{v:5d}  [{lo}..{hi}]"
+        return f"{v:7.2f}  [{lo}..{hi}]"
+
     def _draw_strip(self):
         ww, wh = self.screen.get_size()
         strip_y = wh - THUMB_H - 24
-        # Background
         bar = pygame.Surface((ww, THUMB_H + 24), pygame.SRCALPHA)
         bar.fill((0, 0, 0, 160))
         self.screen.blit(bar, (0, strip_y))
-
         sc = self.scope()
-        if not sc:
-            return
-        # Centre on current; clip to window.
-        thumbs = []
-        widths = []
-        for p in sc:
-            t = self.thumb(p)
-            thumbs.append(t)
-            widths.append(t.get_width() + 8 if t else 0)
-        if self.idx < len(widths):
-            # Compute x so current is centred.
-            x0_of_current = sum(widths[:self.idx]) + widths[self.idx] // 2
-            offset_x = ww // 2 - x0_of_current
-        else:
-            offset_x = 0
-
+        if not sc: return
+        thumbs = [self.thumb(p) for p in sc]
+        widths = [t.get_width() + 8 if t else 0 for t in thumbs]
+        x0_of_current = sum(widths[:self.idx]) + (widths[self.idx] // 2 if self.idx < len(widths) else 0)
+        offset_x = ww // 2 - x0_of_current
         x = offset_x
         y = strip_y + 4
         for i, (p, t) in enumerate(zip(sc, thumbs)):
-            if t is None:
-                continue
+            if t is None: continue
             tw = t.get_width()
             if x + tw < 0 or x > ww:
-                x += tw + 8
-                continue
+                x += tw + 8; continue
             self.screen.blit(t, (x, y))
             if i == self.idx:
                 pygame.draw.rect(self.screen, (255, 200, 0),
@@ -281,30 +500,37 @@ class Splay:
             if p in self.selected:
                 pygame.draw.rect(self.screen, (100, 220, 100),
                                  (x + tw - 12, y + 2, 10, 10))
-            # name underneath, truncated
             name = p.name
-            if len(name) > 16:
-                name = name[:14] + "…"
+            if len(name) > 16: name = name[:14] + "…"
             self._draw_text((x, y + t.get_height() + 2), name)
             x += tw + 8
 
     def _draw_hud(self):
         lines = [
-            "splay — image viewer",
+            "splay" + (f" — app: {self.app.NAME}" if self.app else ""),
             "",
             "← →   prev / next",
-            "s     select current",
-            "d     deselect current",
+            "s     select  d  deselect",
             "l     toggle list / selected mode",
             "w     toggle wipe between last 2 frames",
-            "f     toggle fullscreen",
-            "h     toggle this help",
-            "click pixel-pick (BGR + HSV)",
+            "f     fullscreen   h  this help",
+            "click pixel-pick (also nudges thresholds in app mode)",
             "q     quit",
         ]
+        if self.app:
+            lines += [
+                "",
+                "APP MODE",
+                "o      cycle view (input/wipe/output/mask)",
+                ", .    cycle active parameter",
+                "[ ]    decr / incr by step   { }  by 10× step",
+                "0      reset active param   Shift+0  reset all",
+                "z Z    undo / redo",
+                "Ctrl+R render full clip (confirms)",
+            ]
         pad = 14
         line_h = 20
-        box_w = 360
+        box_w = 420
         box_h = pad * 2 + line_h * len(lines)
         ww, wh = self.screen.get_size()
         bx = ww - box_w - 20
@@ -313,8 +539,7 @@ class Splay:
         s.fill((0, 0, 0, 200))
         self.screen.blit(s, (bx, by))
         for i, line in enumerate(lines):
-            self._draw_text((bx + pad, by + pad + i * line_h), line,
-                            font=self.font_big)
+            self._draw_text((bx + pad, by + pad + i * line_h), line, font=self.font_big)
 
     def _draw_click_info(self):
         x, y, bgr, hsv = self.click_info
@@ -324,34 +549,96 @@ class Splay:
                f"HSV={int(h*180):3d},{int(s*255):3d},{int(v*255):3d}")
         bar = pygame.Surface((640, 22), pygame.SRCALPHA)
         bar.fill((0, 0, 0, 200))
-        self.screen.blit(bar, (6, 28))
-        self._draw_text((10, 31), msg, colour=(255, 220, 100))
+        self.screen.blit(bar, (6, 50))
+        self._draw_text((10, 53), msg, colour=(255, 220, 100))
 
     # ---- input ----
     def on_click(self, screen_pos):
         cur = self.curr_path
-        if not cur:
-            return
+        if not cur: return
         surf = self.load(cur)
-        if surf is None:
-            return
+        if surf is None: return
         target = self.image_blit_rect(surf)
         sx, sy = screen_pos
-        if not target.collidepoint(sx, sy):
-            return
-        # Map screen → image coords.
+        if not target.collidepoint(sx, sy): return
         u = (sx - target.x) / target.w
         v = (sy - target.y) / target.h
         iw, ih = surf.get_size()
         ix = max(0, min(iw - 1, int(u * iw)))
         iy = max(0, min(ih - 1, int(v * ih)))
-        col = surf.get_at((ix, iy))  # RGBA
+        col = surf.get_at((ix, iy))
         r, g, b = col.r, col.g, col.b
         hh, ss, vv = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-        bgr = (b, g, r)
-        self.click_info = (ix, iy, bgr, (hh, ss, vv))
+        self.click_info = (ix, iy, (b, g, r), (hh, ss, vv))
         print(f"  ({ix},{iy})  RGB=({r},{g},{b})  "
               f"HSV=({int(hh*180)},{int(ss*255)},{int(vv*255)})")
+
+        # In app mode, give the app a chance to update params.
+        if self.app and hasattr(self.app, "on_click"):
+            bgr_frame = surface_to_bgr(surf)
+            updates = self.app.on_click(ix, iy, bgr_frame, dict(self.params))
+            if updates:
+                self._push_undo()
+                for k, v in updates.items():
+                    if k in self.params:
+                        spec = self.app.PARAMS[k]
+                        lo, hi, _d, _step, kind = spec
+                        if kind == "int": v = int(round(v))
+                        v = max(lo, min(hi, v))
+                        self.params[k] = v
+                self._invalidate_processed()
+
+    def render_now(self):
+        """Open the render-now confirmation modal."""
+        if not self.app or not hasattr(self.app, "render_command"):
+            print("render: app has no render_command()")
+            return
+        # source = sidecar .source.txt next to current frame, if present
+        src = None
+        if self.curr_path:
+            sidecar = self.curr_path.parent / ".source.txt"
+            if sidecar.is_file():
+                src = sidecar.read_text().strip()
+        try:
+            desc, cmd = self.app.render_command(dict(self.params), src)
+        except Exception as e:
+            print(f"render: app refused: {e}")
+            return
+        print(f"\n=== RENDER NOW ===")
+        print(f"  {desc}")
+        print(f"  command: {' '.join(cmd)}")
+        print(f"  press y to dispatch, n/Esc to cancel...")
+        self._await_confirm(desc, cmd)
+
+    def _await_confirm(self, desc, cmd):
+        # Simple text overlay + blocking key wait.
+        self.screen.fill((20, 20, 20))
+        lines = [
+            "RENDER NOW — CONFIRM",
+            "",
+            desc,
+            "",
+            "command:",
+            " ".join(cmd),
+            "",
+            "press  y  to dispatch",
+            "press  n  or  Esc  to cancel",
+        ]
+        for i, line in enumerate(lines):
+            self._draw_text((30, 30 + i * 22), line, font=self.font_big)
+        pygame.display.flip()
+        waiting = True
+        while waiting:
+            for ev in pygame.event.get():
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_y:
+                        print("dispatching...")
+                        import subprocess
+                        subprocess.Popen(cmd)
+                        waiting = False
+                    elif ev.key in (pygame.K_n, pygame.K_ESCAPE):
+                        print("cancelled.")
+                        waiting = False
 
     def run(self):
         running = True
@@ -361,15 +648,17 @@ class Splay:
                 if ev.type == pygame.QUIT:
                     running = False
                 elif ev.type == pygame.VIDEORESIZE:
-                    self.screen = pygame.display.set_mode(
-                        (ev.w, ev.h), pygame.RESIZABLE)
+                    self.screen = pygame.display.set_mode((ev.w, ev.h), pygame.RESIZABLE)
                 elif ev.type == pygame.MOUSEMOTION and self.wipe_on:
                     self.wipe_x = ev.pos[0]
+                elif ev.type == pygame.MOUSEMOTION and self.app and self.view == VIEW_WIPE:
+                    self.wipe_x = ev.pos[0]
                 elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                    if not self.wipe_on:
+                    if not (self.wipe_on or (self.app and self.view == VIEW_WIPE)):
                         self.on_click(ev.pos)
                 elif ev.type == pygame.KEYDOWN:
                     k = ev.key
+                    mods = pygame.key.get_mods()
                     if k in (pygame.K_q, pygame.K_ESCAPE):
                         running = False
                     elif k == pygame.K_RIGHT:
@@ -390,10 +679,36 @@ class Splay:
                     elif k == pygame.K_f:
                         self.fullscreen = not self.fullscreen
                         flags = pygame.FULLSCREEN if self.fullscreen else pygame.RESIZABLE
-                        self.screen = pygame.display.set_mode((0, 0) if self.fullscreen
-                                                              else (self.window_w,
-                                                                    self.window_h),
-                                                              flags)
+                        self.screen = pygame.display.set_mode(
+                            (0, 0) if self.fullscreen else (self.window_w, self.window_h),
+                            flags)
+                    # App-mode keys
+                    elif self.app and k == pygame.K_o:
+                        self.cycle_view(+1)
+                    elif self.app and k == pygame.K_COMMA:
+                        self.cycle_active_param(-1)
+                    elif self.app and k == pygame.K_PERIOD:
+                        self.cycle_active_param(+1)
+                    elif self.app and k == pygame.K_LEFTBRACKET:
+                        self.adjust_active_param(-1)
+                    elif self.app and k == pygame.K_RIGHTBRACKET:
+                        self.adjust_active_param(+1)
+                    elif self.app and ev.unicode == "{":
+                        self.adjust_active_param(-10)
+                    elif self.app and ev.unicode == "}":
+                        self.adjust_active_param(+10)
+                    elif self.app and k == pygame.K_0:
+                        if mods & pygame.KMOD_SHIFT:
+                            self.reset_all_params()
+                        else:
+                            self.reset_active_param()
+                    elif self.app and k == pygame.K_z:
+                        if mods & pygame.KMOD_SHIFT:
+                            self.redo()
+                        else:
+                            self.undo()
+                    elif self.app and k == pygame.K_r and (mods & pygame.KMOD_CTRL):
+                        self.render_now()
             self.draw()
             clock.tick(60)
         pygame.quit()
@@ -405,15 +720,32 @@ class Splay:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="still-image viewer with wipe + selection")
+    ap = argparse.ArgumentParser(description="image viewer with optional apps")
     ap.add_argument("paths", nargs="*",
                     help="image files or directories (default: cwd)")
+    ap.add_argument("--app", default=None,
+                    help="load image-processing app by name")
+    ap.add_argument("--list-apps", action="store_true",
+                    help="list available apps and exit")
     args = ap.parse_args()
+
+    if args.list_apps:
+        print("apps:")
+        list_apps()
+        return
+
+    app = None
+    if args.app:
+        app = load_app(args.app)
+        # Force the numpy/cv2 import early so we fail fast if missing.
+        _ensure_np_cv2()
+        print(f"loaded app: {app.NAME}")
+
     paths = gather_paths(args.paths)
     if not paths:
         sys.exit("no images found")
     print(f"loaded {len(paths)} image(s). h = help.")
-    Splay(paths).run()
+    Splay(paths, app=app).run()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# sample-frames — extract N evenly-spaced frames from a video for splay --app.
+#
+# Writes frame-NNNN.png + a .source.txt sidecar (containing the source URL
+# or path) into the output dir. Splay apps with render_command() use the
+# sidecar to dispatch the full-clip render against the original source.
+#
+# Usage:
+#   bin/sample-frames <input> [-n 10] [-o ~/tmp/frames-<basename>/]
+#
+# <input> can be a local path or an http(s) URL.
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: $0 <input> [-n N] [-o outdir]" >&2
+    exit 1
+}
+
+[ $# -ge 1 ] || usage
+INPUT="$1"; shift
+N=10
+OUTDIR=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n) N="$2"; shift 2 ;;
+        -o) OUTDIR="$2"; shift 2 ;;
+        *) usage ;;
+    esac
+done
+
+if [ -z "$OUTDIR" ]; then
+    base=$(basename "$INPUT" | sed 's/\.[^.]*$//')
+    OUTDIR="$HOME/tmp/frames-$base"
+fi
+mkdir -p "$OUTDIR"
+
+# Source for ffprobe: if it's a URL, ffprobe can read it directly; if local,
+# require it exists.
+case "$INPUT" in
+    http://*|https://*) SRC="$INPUT" ;;
+    *)
+        [ -f "$INPUT" ] || { echo "no such file: $INPUT" >&2; exit 1; }
+        SRC=$(readlink -f "$INPUT")
+        ;;
+esac
+
+DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$SRC")
+DUR=${DUR%.*}
+[ -n "$DUR" ] && [ "$DUR" -gt 0 ] || { echo "couldn't probe duration" >&2; exit 1; }
+
+echo "source: $SRC"
+echo "duration: ${DUR}s   sampling $N frames into $OUTDIR/"
+
+# Evenly spaced sample times skipping the first/last 5% of the clip
+# (those usually have slate / fade-out artefacts).
+PAD=$(( DUR / 20 ))
+[ "$PAD" -lt 1 ] && PAD=0
+RANGE=$(( DUR - 2 * PAD ))
+
+for i in $(seq 1 "$N"); do
+    if [ "$N" -le 1 ]; then
+        T=$(( PAD ))
+    else
+        T=$(( PAD + RANGE * (i - 1) / (N - 1) ))
+    fi
+    outf=$(printf "%s/frame-%04d.png" "$OUTDIR" "$i")
+    if [ -f "$outf" ]; then
+        echo "  [$i/$N] t=${T}s  (exists, skip)"
+        continue
+    fi
+    echo "  [$i/$N] t=${T}s -> $outf"
+    ffmpeg -y -v error -ss "$T" -i "$SRC" -frames:v 1 "$outf"
+done
+
+# Record the source so a splay app can dispatch a full render against it.
+echo "$INPUT" > "$OUTDIR/.source.txt"
+
+echo
+echo "done. open with:  splay --app skymask $OUTDIR"
