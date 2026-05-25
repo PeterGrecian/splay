@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/peter/splay/.venv/bin/python
 """splay — still-image viewer with selection, wipe, thumbnail strip, and
 optional image-processing apps loaded from ~/splay/apps/ and ~/.config/splay/apps/.
 
@@ -9,15 +9,26 @@ Usage:
     splay --app <name> <files>    # load an image-processing app
 
 Keys (always):
-    ← →         previous / next frame
+    ← →         previous / next frame  (Shift = ±20, ≈1 min at 3s cadence)
     s           select current frame
     d           deselect current frame
     l           toggle list mode / selected-only mode
     w           toggle wipe between two most recently shown frames
-    f           toggle fullscreen
+    f           toggle fullscreen (image only — no overlay; HUD via h)
     h           toggle HUD / help
-    click       pixel-pick (BGR + HSV); in app mode, also nudges thresholds
-    q / Esc     quit
+    t           toggle thumbnail strip
+    r           reload changed / pick up new files in source dirs
+    R           toggle auto-reload (rescans once a second; default off)
+    0           fit image to window
+    1           pixel-for-pixel (100%)
+    2           zoomed in (200%)
+    p           pixel data at mouse position (BGR + HSV)
+    m           toggle hot-pixel mask (FITS only)
+    M           toggle red highlight of hot pixels (FITS only)
+    z / x       step backward / forward through sibling masks
+                (siblings = hot-pixels-*.fits.fz next to the seed mask)
+    L-drag      pan the image when zoomed (1x / 2x)
+    Esc         quit
 
 Keys (in --app mode):
     o           cycle view: input / wipe / output / mask
@@ -31,10 +42,36 @@ Keys (in --app mode):
 """
 
 import argparse, importlib.util, os, pathlib, sys, copy
+import json, socket, threading
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
 import colorsys
 
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
+
+SPLAY_SOCKET_PATH = f"/tmp/splay-{os.environ.get('USER', 'user')}.sock"
+
+
+def send_to_running_instance(abs_paths):
+    """Try to deliver a list of absolute paths to a running splay.
+    Returns True if delivered, False if no instance is listening."""
+    if not os.path.exists(SPLAY_SOCKET_PATH):
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(SPLAY_SOCKET_PATH)
+        msg = json.dumps({"cmd": "open", "paths": abs_paths}) + "\n"
+        s.sendall(msg.encode())
+        s.close()
+        return True
+    except (OSError, socket.timeout):
+        try: os.unlink(SPLAY_SOCKET_PATH)  # stale
+        except OSError: pass
+        return False
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp",
+            ".fits", ".fit", ".fts", ".fz"}
+FITS_EXTS = {".fits", ".fit", ".fts", ".fz"}
 THUMB_H = 80
 
 VIEW_INPUT = 0
@@ -49,16 +86,18 @@ def gather_paths(args):
     if not args:
         args = ["."]
     out = []
+    dirs = []
     for a in args:
         p = pathlib.Path(a)
         if p.is_dir():
+            dirs.append(p)
             out.extend(sorted(x for x in p.iterdir()
                               if x.suffix.lower() in IMG_EXTS))
         elif p.is_file():
             out.append(p)
         else:
             print(f"skip: {p} not found", file=sys.stderr)
-    return out
+    return out, dirs
 
 
 def fit_into(img_w, img_h, box_w, box_h):
@@ -106,6 +145,102 @@ def list_apps():
 
 _np = None
 _cv2 = None
+
+
+def _read_fits_image(path):
+    """Return the first 2-D image HDU's data as float32 ndarray."""
+    import numpy as np
+    from astropy.io import fits
+    with fits.open(str(path)) as hdul:
+        data = None
+        for hdu in hdul:
+            if hdu.data is not None and hasattr(hdu.data, "ndim") and hdu.data.ndim >= 2:
+                data = hdu.data
+                break
+        if data is None:
+            raise ValueError(f"{path}: no image HDU found")
+    if data.ndim == 3:
+        data = data[0]
+    return np.asarray(data, dtype=np.float32)
+
+
+def _apply_hot_pixel_mask(data, mask):
+    """Replace masked pixels with the median of their 8 neighbours
+    (excluding any neighbour that is itself masked)."""
+    import numpy as np
+    if mask.shape != data.shape: return data
+    h, w = data.shape
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        return data
+    # Gather neighbours via padded arrays, vectorised. Pad with NaN so we can
+    # ignore out-of-frame and other-masked neighbours via nanmedian.
+    pad_data = np.full((h + 2, w + 2), np.nan, dtype=np.float32)
+    pad_data[1:-1, 1:-1] = data
+    pad_data[1:-1, 1:-1][mask] = np.nan  # exclude masked-neighbour contributions
+    # Stack the 8 neighbour offsets for every hot pixel: shape (N, 8)
+    yy = ys + 1  # shift into padded coords
+    xx = xs + 1
+    offsets = [(-1,-1), (-1,0), (-1,1),
+               ( 0,-1),         ( 0,1),
+               ( 1,-1), ( 1,0), ( 1,1)]
+    stack = np.stack([pad_data[yy + dy, xx + dx] for dy, dx in offsets], axis=1)
+    with np.errstate(all="ignore"):
+        medians = np.nanmedian(stack, axis=1)
+    # Fall back to original where every neighbour was NaN.
+    out = data.copy()
+    valid = np.isfinite(medians)
+    out[ys[valid], xs[valid]] = medians[valid]
+    return out
+
+
+def fits_array_to_surface(data):
+    """float32 ndarray → pygame Surface (auto-stretched greyscale)."""
+    import numpy as np
+    finite = np.isfinite(data)
+    if not finite.any():
+        data8 = np.zeros(data.shape, dtype=np.uint8)
+    else:
+        vals = data[finite]
+        lo, hi = np.percentile(vals, [0.5, 99.5])
+        if hi <= lo: hi = lo + 1.0
+        norm = np.clip((data - lo) / (hi - lo), 0.0, 1.0)
+        norm[~finite] = 0.0
+        data8 = (norm * 255).astype(np.uint8)
+    rgb = np.stack([data8, data8, data8], axis=-1)
+    rgb = np.transpose(rgb, (1, 0, 2))  # pygame wants (W, H, 3)
+    return pygame.surfarray.make_surface(rgb)
+
+
+_hot_pixel_mask_cache = {}  # path -> bool ndarray
+
+def get_hot_pixel_mask(path):
+    """Load hot-pixel mask FITS once, cache as bool array (non-zero = hot)."""
+    import numpy as np
+    if path is None: return None
+    key = str(path)
+    if key in _hot_pixel_mask_cache:
+        return _hot_pixel_mask_cache[key]
+    try:
+        arr = _read_fits_image(pathlib.Path(path))
+    except Exception as e:
+        print(f"hot-pixel mask: failed to load {path}: {e}", file=sys.stderr)
+        _hot_pixel_mask_cache[key] = None
+        return None
+    mask = arr != 0
+    _hot_pixel_mask_cache[key] = mask
+    print(f"hot-pixel mask: {path}  ({int(mask.sum())} hot px, {mask.shape[1]}×{mask.shape[0]})")
+    return mask
+
+
+def hot_pixel_count(path):
+    m = get_hot_pixel_mask(path)
+    if m is None: return None
+    import numpy as np
+    return int(m.sum())
+
+
+
 def _ensure_np_cv2():
     global _np, _cv2
     if _np is None:
@@ -132,22 +267,53 @@ def bgr_to_surface(bgr):
 # ---- main viewer -------------------------------------------------------------
 
 class Splay:
-    def __init__(self, paths, app=None):
+    def __init__(self, paths, app=None, hot_pixel_mask_path=None,
+                 mask_on=True, highlight=False,
+                 show_strip=True, show_hud=False, fullscreen=False,
+                 list_mode=True,
+                 source_dirs=None, auto_reload=False):
         if not paths:
             sys.exit("no images")
         self.paths = paths
         self.images = {}     # path -> pygame.Surface (lazy)
+        self.fits_data = {}  # path -> raw float32 ndarray (FITS only)
         self.thumbs = {}
+        self.hot_pixel_mask_paths = self._discover_masks(hot_pixel_mask_path)
+        self.hot_pixel_mask_idx = 0
+        self.hot_pixel_mask_path = (self.hot_pixel_mask_paths[0]
+                                    if self.hot_pixel_mask_paths else None)
+        self.hot_pixel_mask_on = bool(self.hot_pixel_mask_path) and mask_on
+        self.hot_pixel_highlight = highlight and bool(self.hot_pixel_mask_path)
+
+        # File-change tracking.
+        self.source_dirs = list(source_dirs or [])
+        self.auto_reload = auto_reload
+        self.last_auto_scan = 0.0
+        self.mtimes = {}  # path -> float mtime at load time
+        for p in paths:
+            try: self.mtimes[p] = p.stat().st_mtime
+            except OSError: pass
+
+        # Single-instance IPC.
+        self._ipc_lock = threading.Lock()
+        self._ipc_pending = []  # list of path strings from remote invocations
+        self._ipc_sock = None
+        self._start_ipc_server()
         self.selected = set()
-        self.list_mode = True
+        self.list_mode = list_mode
         self.idx = 0
         self.prev_path = None
         self.curr_path = None
         self.wipe_on = False
         self.wipe_x = None
-        self.show_hud = False
-        self.show_strip = True
-        self.fullscreen = False
+        self.show_hud = show_hud
+        self.show_strip = show_strip
+        self.fullscreen = fullscreen
+        self.zoom_mode = "fit"   # "fit", "1x", "2x"
+        self.pan_x = 0
+        self.pan_y = 0
+        self.dragging = False
+        self.drag_last = None
         self.click_info = None
 
         # App state.
@@ -164,8 +330,11 @@ class Splay:
         pygame.display.set_caption(f"splay{' — ' + app.NAME if app else ''}")
         info = pygame.display.Info()
         self.window_w, self.window_h = int(info.current_w * 0.8), int(info.current_h * 0.8)
-        self.screen = pygame.display.set_mode((self.window_w, self.window_h),
-                                              pygame.RESIZABLE)
+        if self.fullscreen:
+            self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            self.screen = pygame.display.set_mode((self.window_w, self.window_h),
+                                                  pygame.RESIZABLE)
         self.font = pygame.font.SysFont("monospace", 14)
         self.font_big = pygame.font.SysFont("monospace", 16)
         self._show_current()
@@ -186,19 +355,97 @@ class Splay:
     def load(self, path):
         if path not in self.images:
             try:
-                self.images[path] = pygame.image.load(str(path)).convert()
+                if path.suffix.lower() in FITS_EXTS:
+                    if path not in self.fits_data:
+                        self.fits_data[path] = _read_fits_image(path)
+                    self.images[path] = self._render_fits(path).convert()
+                else:
+                    self.images[path] = pygame.image.load(str(path)).convert()
             except Exception as e:
                 print(f"failed to load {path}: {e}", file=sys.stderr)
                 return None
         return self.images[path]
 
+    def _render_fits(self, path):
+        import numpy as np
+        data = self.fits_data[path]
+        mask = get_hot_pixel_mask(self.hot_pixel_mask_path) if self.hot_pixel_mask_path else None
+        if self.hot_pixel_mask_on and mask is not None:
+            data = _apply_hot_pixel_mask(data, mask)
+        surf = fits_array_to_surface(data)
+        if self.hot_pixel_highlight and mask is not None and mask.shape == data.shape:
+            arr = pygame.surfarray.pixels3d(surf)  # (W, H, 3)
+            mask_wh = mask.T  # to (W, H)
+            arr[mask_wh, 0] = 255
+            arr[mask_wh, 1] = 0
+            arr[mask_wh, 2] = 0
+            del arr
+        return surf
+
+    def toggle_hot_pixel_mask(self):
+        if not self.hot_pixel_mask_path:
+            print("no hot-pixel mask configured (use --hot-pixel-mask)")
+            return
+        self.hot_pixel_mask_on = not self.hot_pixel_mask_on
+        self._invalidate_fits_surfaces()
+        print(f"hot-pixel mask: {'on' if self.hot_pixel_mask_on else 'off'}")
+
+    def toggle_hot_pixel_highlight(self):
+        if not self.hot_pixel_mask_path:
+            print("no hot-pixel mask configured (use --hot-pixel-mask)")
+            return
+        self.hot_pixel_highlight = not self.hot_pixel_highlight
+        self._invalidate_fits_surfaces()
+        print(f"hot-pixel highlight: {'on' if self.hot_pixel_highlight else 'off'}")
+
+    def _invalidate_fits_surfaces(self):
+        # Only invalidate main-display surfaces — thumbnails ignore the mask.
+        for p in list(self.fits_data.keys()):
+            self.images.pop(p, None)
+
+    def _discover_masks(self, seed_path):
+        """Find sibling masks matching hot-pixels-*.fits.fz next to seed_path.
+        Returns a list with seed_path first, then any others (sorted) it finds."""
+        if not seed_path: return []
+        p = pathlib.Path(seed_path)
+        if not p.is_file(): return []
+        siblings = sorted(p.parent.glob("hot-pixels-*.fits.fz"))
+        if p not in siblings:
+            return [p] + siblings
+        # Keep current first for convenience.
+        siblings.remove(p)
+        return [p] + siblings
+
+    def step_mask(self, delta):
+        if not self.hot_pixel_mask_paths:
+            print("no hot-pixel masks discovered")
+            return
+        n = len(self.hot_pixel_mask_paths)
+        self.hot_pixel_mask_idx = (self.hot_pixel_mask_idx + delta) % n
+        self.hot_pixel_mask_path = self.hot_pixel_mask_paths[self.hot_pixel_mask_idx]
+        self._invalidate_fits_surfaces()
+        print(f"mask [{self.hot_pixel_mask_idx+1}/{n}]: {self.hot_pixel_mask_path.name}")
+
     def thumb(self, path):
         if path not in self.thumbs:
-            img = self.load(path)
-            if img is None: return None
-            w, h = img.get_size()
+            # For FITS thumbs, build directly from the raw array with NO
+            # hot-pixel patching — at thumbnail scale the dots are invisible
+            # and patching costs ~40ms per frame.
+            if path.suffix.lower() in FITS_EXTS:
+                try:
+                    if path not in self.fits_data:
+                        self.fits_data[path] = _read_fits_image(path)
+                    surf = fits_array_to_surface(self.fits_data[path])
+                except Exception as e:
+                    print(f"thumb: failed to load {path}: {e}", file=sys.stderr)
+                    return None
+            else:
+                img = self.load(path)
+                if img is None: return None
+                surf = img
+            w, h = surf.get_size()
             tw, th = fit_into(w, h, THUMB_H * 2, THUMB_H)
-            self.thumbs[path] = pygame.transform.smoothscale(img, (tw, th))
+            self.thumbs[path] = pygame.transform.smoothscale(surf, (tw, th))
         return self.thumbs[path]
 
     # ---- processed (app output) ----
@@ -273,6 +520,153 @@ class Splay:
         self.wipe_on = not self.wipe_on
         if self.wipe_on: self.wipe_x = mouse_x
 
+    def reload_changed(self, verbose=True):
+        """Scan source dirs for new files and check mtimes on known paths.
+        Invalidate caches for anything that changed; re-show current frame
+        if its bytes changed."""
+        added = 0
+        changed = 0
+        # 1. Discover new files in source directories.
+        if self.source_dirs:
+            existing = set(self.paths)
+            new_paths = []
+            for d in self.source_dirs:
+                try:
+                    for x in sorted(d.iterdir()):
+                        if x.suffix.lower() in IMG_EXTS and x not in existing:
+                            new_paths.append(x)
+                            existing.add(x)
+                except OSError:
+                    continue
+            if new_paths:
+                cur = self.curr_path
+                self.paths = sorted(self.paths + new_paths)
+                for p in new_paths:
+                    try: self.mtimes[p] = p.stat().st_mtime
+                    except OSError: pass
+                added = len(new_paths)
+                # Preserve current frame position.
+                sc = self.scope()
+                if cur and cur in sc:
+                    self.idx = sc.index(cur)
+        # 2. Check mtimes on already-loaded paths.
+        for p in list(self.mtimes):
+            try: m = p.stat().st_mtime
+            except OSError: continue
+            if m != self.mtimes[p]:
+                self.mtimes[p] = m
+                self.images.pop(p, None)
+                self.thumbs.pop(p, None)
+                self.fits_data.pop(p, None)
+                changed += 1
+        if verbose and (added or changed):
+            print(f"reload: +{added} new, {changed} changed")
+        return added, changed
+
+    def _start_ipc_server(self):
+        try:
+            if os.path.exists(SPLAY_SOCKET_PATH):
+                os.unlink(SPLAY_SOCKET_PATH)
+            self._ipc_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._ipc_sock.bind(SPLAY_SOCKET_PATH)
+            self._ipc_sock.listen(4)
+        except OSError as e:
+            print(f"warning: IPC listener disabled: {e}", file=sys.stderr)
+            self._ipc_sock = None
+            return
+        t = threading.Thread(target=self._ipc_serve_loop, daemon=True)
+        t.start()
+
+    def _ipc_serve_loop(self):
+        while True:
+            try:
+                conn, _ = self._ipc_sock.accept()
+            except OSError:
+                return
+            try:
+                data = b""
+                conn.settimeout(1.0)
+                while b"\n" not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk: break
+                    data += chunk
+                line = data.split(b"\n", 1)[0]
+                msg = json.loads(line.decode())
+                if msg.get("cmd") == "open":
+                    with self._ipc_lock:
+                        self._ipc_pending.extend(msg.get("paths", []))
+            except (OSError, ValueError):
+                pass
+            finally:
+                conn.close()
+
+    def _drain_ipc(self):
+        with self._ipc_lock:
+            if not self._ipc_pending: return
+            incoming = self._ipc_pending
+            self._ipc_pending = []
+        new_paths = []
+        existing = set(self.paths)
+        for s in incoming:
+            p = pathlib.Path(s)
+            if p.is_dir():
+                if p not in self.source_dirs:
+                    self.source_dirs.append(p)
+                for x in sorted(p.iterdir()):
+                    if x.suffix.lower() in IMG_EXTS and x not in existing:
+                        new_paths.append(x); existing.add(x)
+            elif p.is_file() and p not in existing:
+                new_paths.append(p); existing.add(p)
+        if not new_paths:
+            self._raise_window()
+            return
+        self.paths = sorted(self.paths + new_paths)
+        for p in new_paths:
+            try: self.mtimes[p] = p.stat().st_mtime
+            except OSError: pass
+        # Jump to the first newly-added path.
+        first = new_paths[0]
+        sc = self.scope()
+        if first in sc:
+            self.idx = sc.index(first)
+            self._show_current()
+        print(f"ipc: opened {len(new_paths)} new path(s); jumping to {first.name}")
+        self._raise_window()
+
+    def _raise_window(self):
+        # Best-effort raise/focus. SDL doesn't expose a portable raise, so
+        # we toggle minimized state if needed and rely on the WM.
+        try:
+            pygame.display.iconify  # not all backends have this
+        except AttributeError:
+            return
+        # On X11, briefly setting and clearing fullscreen tends to raise.
+        # Cheaper: just set the window caption with a tag; user can alt-tab.
+        # We don't have a reliable cross-WM raise from inside pygame.
+
+    def toggle_auto_reload(self):
+        self.auto_reload = not self.auto_reload
+        print(f"auto-reload: {'on' if self.auto_reload else 'off'}")
+
+    def _toggle_fullscreen(self):
+        # Aim: minimise intermediate frames the WM might show during the
+        # destroy/recreate of the SDL window. Order:
+        #   1. flip state and overlays first, so the next draw is final
+        #   2. paint the current screen black (covers any WM artefacts)
+        #   3. swap modes
+        #   4. immediately redraw at the new size so we never present a stale
+        #      surface
+        self.fullscreen = not self.fullscreen
+        self.screen.fill((0, 0, 0))
+        pygame.display.flip()
+        flags = pygame.FULLSCREEN if self.fullscreen else pygame.RESIZABLE
+        size = (0, 0) if self.fullscreen else (self.window_w, self.window_h)
+        self.screen = pygame.display.set_mode(size, flags)
+        # Drop any VIDEORESIZE events generated by the mode switch so we don't
+        # reprocess them in the main loop.
+        pygame.event.clear(pygame.VIDEORESIZE)
+        self.draw()
+
     def cycle_view(self, delta=1):
         if not self.app: return
         order = [VIEW_INPUT, VIEW_WIPE, VIEW_OUTPUT, VIEW_MASK]
@@ -333,14 +727,24 @@ class Splay:
     # ---- layout ----
     def display_area(self):
         ww, wh = self.screen.get_size()
-        strip_h = THUMB_H + 24 if self.show_strip else 0
+        show_strip = self.show_strip and not self.fullscreen
+        strip_h = THUMB_H + 24 if show_strip else 0
         return pygame.Rect(0, 0, ww, max(1, wh - strip_h))
 
     def image_blit_rect(self, surf):
         area = self.display_area()
-        w, h = fit_into(surf.get_width(), surf.get_height(), area.w, area.h)
+        iw, ih = surf.get_width(), surf.get_height()
+        if self.zoom_mode == "1x":
+            w, h = iw, ih
+        elif self.zoom_mode == "2x":
+            w, h = iw * 2, ih * 2
+        else:
+            w, h = fit_into(iw, ih, area.w, area.h)
         x = area.x + (area.w - w) // 2
         y = area.y + (area.h - h) // 2
+        if self.zoom_mode != "fit":
+            x += self.pan_x
+            y += self.pan_y
         return pygame.Rect(x, y, w, h)
 
     # ---- which surface to show? ----
@@ -373,11 +777,12 @@ class Splay:
                 scaled = pygame.transform.smoothscale(surf, target.size)
                 self.screen.blit(scaled, target.topleft)
 
-        if self.show_strip: self._draw_strip()
-        self._draw_status()
-        if self.app: self._draw_params_panel()
+        if not self.fullscreen:
+            if self.show_strip: self._draw_strip()
+            self._draw_status()
+            if self.app: self._draw_params_panel()
+            if self.click_info: self._draw_click_info()
         if self.show_hud: self._draw_hud()
-        if self.click_info: self._draw_click_info()
         pygame.display.flip()
 
     def _draw_pair_wipe(self):
@@ -482,40 +887,83 @@ class Splay:
         self.screen.blit(bar, (0, strip_y))
         sc = self.scope()
         if not sc: return
-        thumbs = [self.thumb(p) for p in sc]
-        widths = [t.get_width() + 8 if t else 0 for t in thumbs]
-        x0_of_current = sum(widths[:self.idx]) + (widths[self.idx] // 2 if self.idx < len(widths) else 0)
-        offset_x = ww // 2 - x0_of_current
-        x = offset_x
+        # Strip rendering: only build at most one *new* thumbnail per draw,
+        # and never build thumbs more than WINDOW frames from idx. This keeps
+        # the UI responsive even on huge FITS dirs where each decode is slow.
+        WINDOW = 10
+        MAX_NEW_PER_FRAME = 1
+        nom_w = THUMB_H * 2  # placeholder width for unloaded thumbs
+        slot_w = nom_w + 8
+        offset_x = ww // 2 - (self.idx * slot_w + slot_w // 2)
         y = strip_y + 4
-        for i, (p, t) in enumerate(zip(sc, thumbs)):
-            if t is None: continue
-            tw = t.get_width()
-            if x + tw < 0 or x > ww:
-                x += tw + 8; continue
-            self.screen.blit(t, (x, y))
+        new_built = 0
+        for i, p in enumerate(sc):
+            x = offset_x + i * slot_w
+            if x + slot_w < 0 or x > ww:
+                continue
+            t = self.thumbs.get(p)
+            if t is None and abs(i - self.idx) <= WINDOW and new_built < MAX_NEW_PER_FRAME:
+                t = self.thumb(p)
+                new_built += 1
+            if t is None:
+                pygame.draw.rect(self.screen, (40, 40, 40),
+                                 (x, y, nom_w, THUMB_H), 0)
+                pygame.draw.rect(self.screen, (70, 70, 70),
+                                 (x, y, nom_w, THUMB_H), 1)
+                tw, th = nom_w, THUMB_H
+            else:
+                tw = t.get_width()
+                self.screen.blit(t, (x, y))
+                th = t.get_height()
             if i == self.idx:
                 pygame.draw.rect(self.screen, (255, 200, 0),
-                                 (x - 2, y - 2, tw + 4, t.get_height() + 4), 2)
+                                 (x - 2, y - 2, tw + 4, th + 4), 2)
             if p in self.selected:
                 pygame.draw.rect(self.screen, (100, 220, 100),
                                  (x + tw - 12, y + 2, 10, 10))
             name = p.name
             if len(name) > 16: name = name[:14] + "…"
-            self._draw_text((x, y + t.get_height() + 2), name)
-            x += tw + 8
+            self._draw_text((x, y + th + 2), name)
 
     def _draw_hud(self):
+        sc = self.scope()
+        n = len(sc)
+        frame = f"frame {self.idx+1}/{n}: {self.curr_path.name if self.curr_path else '—'}"
+        if self.curr_path and self.curr_path in self.images:
+            iw, ih = self.images[self.curr_path].get_size()
+            frame += f"  ({iw}×{ih})"
+        mask_line = "hot-pixel mask: "
+        if not self.hot_pixel_mask_path:
+            mask_line += "(none configured)"
+        else:
+            n = hot_pixel_count(self.hot_pixel_mask_path)
+            n_str = f"{n} px" if n is not None else "load failed"
+            state = "ON" if self.hot_pixel_mask_on else "off"
+            hl = "  HIGHLIGHT" if self.hot_pixel_highlight else ""
+            nm = self.hot_pixel_mask_path.name
+            pos = ""
+            if len(self.hot_pixel_mask_paths) > 1:
+                pos = f"  ({self.hot_pixel_mask_idx+1}/{len(self.hot_pixel_mask_paths)})"
+            mask_line += f"{state}  [{n_str}]{hl}  {nm}{pos}"
         lines = [
             "splay" + (f" — app: {self.app.NAME}" if self.app else ""),
+            frame,
+            f"zoom: {self.zoom_mode}    auto-reload: {'ON' if self.auto_reload else 'off'}",
+            mask_line,
             "",
-            "← →   prev / next",
+            "← →   prev / next   (Shift+← →  jump ±20)",
             "s     select  d  deselect",
             "l     toggle list / selected mode",
             "w     toggle wipe between last 2 frames",
-            "f     fullscreen   h  this help",
-            "click pixel-pick (also nudges thresholds in app mode)",
-            "q     quit",
+            "f     fullscreen (image only)   h  this help",
+            "t     toggle thumbnail strip",
+            "r / R reload now / toggle auto-reload",
+            "0 1 2 fit / 1:1 / 2× zoom",
+            "p     pixel data at mouse position",
+            "m / M toggle hot-pixel mask / red-highlight (FITS)",
+            "z x   step through pre-generated masks",
+            "L-drag pan when zoomed",
+            "Esc   quit",
         ]
         if self.app:
             lines += [
@@ -542,15 +990,22 @@ class Splay:
             self._draw_text((bx + pad, by + pad + i * line_h), line, font=self.font_big)
 
     def _draw_click_info(self):
-        x, y, bgr, hsv = self.click_info
+        x, y, bgr, hsv, frame_label, mask_label, is_hot = self.click_info
         b, g, r = bgr
         h, s, v = hsv
-        msg = (f"({x},{y})  RGB={r:3d},{g:3d},{b:3d}  "
-               f"HSV={int(h*180):3d},{int(s*255):3d},{int(v*255):3d}")
-        bar = pygame.Surface((640, 22), pygame.SRCALPHA)
+        line1 = (f"({x},{y})  RGB={r:3d},{g:3d},{b:3d}  "
+                 f"HSV={int(h*180):3d},{int(s*255):3d},{int(v*255):3d}")
+        hot_tag = ""
+        if is_hot is True: hot_tag = "  HOT"
+        elif is_hot is False: hot_tag = "  (not hot)"
+        line2 = f"{frame_label}   {mask_label}{hot_tag}"
+        width = max(640, 12 + 8 * max(len(line1), len(line2)))
+        bar = pygame.Surface((width, 44), pygame.SRCALPHA)
         bar.fill((0, 0, 0, 200))
         self.screen.blit(bar, (6, 50))
-        self._draw_text((10, 53), msg, colour=(255, 220, 100))
+        self._draw_text((10, 53), line1, colour=(255, 220, 100))
+        col = (255, 120, 120) if is_hot else (200, 200, 255)
+        self._draw_text((10, 71), line2, colour=col)
 
     # ---- input ----
     def on_click(self, screen_pos):
@@ -569,7 +1024,26 @@ class Splay:
         col = surf.get_at((ix, iy))
         r, g, b = col.r, col.g, col.b
         hh, ss, vv = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-        self.click_info = (ix, iy, (b, g, r), (hh, ss, vv))
+        # Capture context: frame, mask state, and whether this pixel is a hot
+        # pixel in the active mask.
+        frame_label = f"{cur.name} [{self.idx+1}/{len(self.scope())}]"
+        if self.hot_pixel_mask_path:
+            mstate = "ON" if self.hot_pixel_mask_on else "off"
+            mname = self.hot_pixel_mask_path.name
+            mask_label = f"mask:{mstate} {mname}"
+        else:
+            mask_label = "mask:(none)"
+        is_hot = None
+        if self.hot_pixel_mask_path:
+            m = get_hot_pixel_mask(self.hot_pixel_mask_path)
+            if m is not None and 0 <= iy < m.shape[0] and 0 <= ix < m.shape[1]:
+                is_hot = bool(m[iy, ix])
+        self.click_info = (ix, iy, (b, g, r), (hh, ss, vv),
+                           frame_label, mask_label, is_hot)
+        hot_tag = ""
+        if is_hot is True: hot_tag = "  HOT"
+        elif is_hot is False: hot_tag = "  (not hot)"
+        print(f"  {frame_label}  {mask_label}{hot_tag}")
         print(f"  ({ix},{iy})  RGB=({r},{g},{b})  "
               f"HSV=({int(hh*180)},{int(ss*255)},{int(vv*255)})")
 
@@ -641,9 +1115,14 @@ class Splay:
                         waiting = False
 
     def run(self):
+        import time
         running = True
         clock = pygame.time.Clock()
         while running:
+            self._drain_ipc()
+            if self.auto_reload and time.monotonic() - self.last_auto_scan >= 1.0:
+                self.last_auto_scan = time.monotonic()
+                self.reload_changed(verbose=False)
             for ev in pygame.event.get():
                 if ev.type == pygame.QUIT:
                     running = False
@@ -653,18 +1132,48 @@ class Splay:
                     self.wipe_x = ev.pos[0]
                 elif ev.type == pygame.MOUSEMOTION and self.app and self.view == VIEW_WIPE:
                     self.wipe_x = ev.pos[0]
+                elif ev.type == pygame.MOUSEMOTION and self.dragging:
+                    dx = ev.pos[0] - self.drag_last[0]
+                    dy = ev.pos[1] - self.drag_last[1]
+                    self.pan_x += dx
+                    self.pan_y += dy
+                    self.drag_last = ev.pos
                 elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                    if not (self.wipe_on or (self.app and self.view == VIEW_WIPE)):
+                    if self.wipe_on or (self.app and self.view == VIEW_WIPE):
+                        pass
+                    elif self.app:
                         self.on_click(ev.pos)
+                    elif self.zoom_mode != "fit":
+                        self.dragging = True
+                        self.drag_last = ev.pos
+                elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+                    self.dragging = False
                 elif ev.type == pygame.KEYDOWN:
                     k = ev.key
                     mods = pygame.key.get_mods()
-                    if k in (pygame.K_q, pygame.K_ESCAPE):
+                    if k == pygame.K_ESCAPE:
                         running = False
+                    elif k == pygame.K_0 and not self.app:
+                        self.zoom_mode = "fit"; self.pan_x = self.pan_y = 0
+                    elif k == pygame.K_1 and not self.app:
+                        self.zoom_mode = "1x"; self.pan_x = self.pan_y = 0
+                    elif k == pygame.K_2 and not self.app:
+                        self.zoom_mode = "2x"; self.pan_x = self.pan_y = 0
+                    elif k == pygame.K_p:
+                        self.on_click(pygame.mouse.get_pos())
+                    elif k == pygame.K_m:
+                        if mods & pygame.KMOD_SHIFT:
+                            self.toggle_hot_pixel_highlight()
+                        else:
+                            self.toggle_hot_pixel_mask()
+                    elif not self.app and k == pygame.K_z:
+                        self.step_mask(-1)
+                    elif not self.app and k == pygame.K_x:
+                        self.step_mask(+1)
                     elif k == pygame.K_RIGHT:
-                        self.next(+1)
+                        self.next(+20 if mods & pygame.KMOD_SHIFT else +1)
                     elif k == pygame.K_LEFT:
-                        self.next(-1)
+                        self.next(-20 if mods & pygame.KMOD_SHIFT else -1)
                     elif k == pygame.K_s:
                         self.select()
                     elif k == pygame.K_d:
@@ -676,12 +1185,15 @@ class Splay:
                         self.toggle_wipe(mx)
                     elif k == pygame.K_h:
                         self.show_hud = not self.show_hud
+                    elif k == pygame.K_t:
+                        self.show_strip = not self.show_strip
+                    elif not self.app and k == pygame.K_r:
+                        if mods & pygame.KMOD_SHIFT:
+                            self.toggle_auto_reload()
+                        else:
+                            self.reload_changed()
                     elif k == pygame.K_f:
-                        self.fullscreen = not self.fullscreen
-                        flags = pygame.FULLSCREEN if self.fullscreen else pygame.RESIZABLE
-                        self.screen = pygame.display.set_mode(
-                            (0, 0) if self.fullscreen else (self.window_w, self.window_h),
-                            flags)
+                        self._toggle_fullscreen()
                     # App-mode keys
                     elif self.app and k == pygame.K_o:
                         self.cycle_view(+1)
@@ -712,6 +1224,11 @@ class Splay:
             self.draw()
             clock.tick(60)
         pygame.quit()
+        if self._ipc_sock is not None:
+            try: self._ipc_sock.close()
+            except OSError: pass
+            try: os.unlink(SPLAY_SOCKET_PATH)
+            except OSError: pass
         if self.selected:
             print("\nselected:")
             for p in self.paths:
@@ -720,19 +1237,71 @@ class Splay:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="image viewer with optional apps")
+    ap = argparse.ArgumentParser(
+        description="splay — still-image viewer with selection, wipe, "
+                    "thumbnail strip, and optional image-processing apps.",
+        epilog=(
+            "Usage examples:\n"
+            "  splay                       # all images in current directory\n"
+            "  splay path/to/dir           # all images in given directory (non-recursive)\n"
+            "  splay a.png b.jpg c.fits.fz # explicit list of files\n"
+            "  splay dir1/ extra.png dir2/ # mix directories and files freely\n"
+            "  splay --app skymask dir/   # run an image-processing app over a directory\n"
+            "\n"
+            "Supported formats: png, jpg, jpeg, bmp, gif, tif, tiff, webp,\n"
+            "                   fits, fit, fts, fz (FITS, Rice-compressed)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("paths", nargs="*",
-                    help="image files or directories (default: cwd)")
+                    help="any mix of image files and directories. "
+                         "Directory contents are loaded non-recursively "
+                         "in name order. Defaults to the current directory.")
     ap.add_argument("--app", default=None,
                     help="load image-processing app by name")
     ap.add_argument("--list-apps", action="store_true",
                     help="list available apps and exit")
+    ap.add_argument("-m", "--hot-pixel-mask",
+                    default="/mnt/puppy/starcam-frames/night/hot-pixels-starcam.fits.fz",
+                    help="path to hot-pixel mask FITS (toggle with 'm' "
+                         "while viewing FITS frames). Pass empty string to disable.")
+    ap.add_argument("--no-mask", action="store_true",
+                    help="start with the hot-pixel mask disabled "
+                         "(equivalent to pressing 'm' once at startup)")
+    ap.add_argument("--highlight", action="store_true",
+                    help="start with hot-pixel red highlight on (toggle with 'M')")
+    ap.add_argument("-t", "--no-thumbnails", action="store_true",
+                    help="hide the thumbnail strip at startup (toggle with 't')")
+    ap.add_argument("--hud", action="store_true",
+                    help="show the HUD/help overlay at startup (toggle with 'h')")
+    ap.add_argument("-f", "--fullscreen", action="store_true",
+                    help="start in fullscreen mode (toggle with 'f')")
+    ap.add_argument("--selected-mode", action="store_true",
+                    help="start in selected-only mode rather than list mode "
+                         "(toggle with 'l')")
+    ap.add_argument("--auto-reload", action="store_true",
+                    help="start with auto-reload on — splay rescans source "
+                         "dirs once per second and picks up new/changed files "
+                         "(toggle with 'R'). Manual reload is 'r'.")
+    ap.add_argument("--new-instance", action="store_true",
+                    help="always spawn a new splay process. Without this flag, "
+                         "if a splay is already running it receives the "
+                         "files/dirs and is raised to the foreground.")
     args = ap.parse_args()
 
     if args.list_apps:
         print("apps:")
         list_apps()
         return
+
+    # Single-instance: try to hand off to a running splay before doing
+    # anything heavy. Only triggers when the user explicitly named paths
+    # (so a bare `splay` always opens a fresh instance on the cwd).
+    if args.paths and not args.new_instance and not args.app:
+        abs_paths = [str(pathlib.Path(p).resolve()) for p in args.paths]
+        if send_to_running_instance(abs_paths):
+            print(f"handed off {len(abs_paths)} path(s) to running splay")
+            return
 
     app = None
     if args.app:
@@ -741,11 +1310,23 @@ def main():
         _ensure_np_cv2()
         print(f"loaded app: {app.NAME}")
 
-    paths = gather_paths(args.paths)
+    paths, source_dirs = gather_paths(args.paths)
     if not paths:
         sys.exit("no images found")
     print(f"loaded {len(paths)} image(s). h = help.")
-    Splay(paths, app=app).run()
+    mask_path = args.hot_pixel_mask or None
+    if mask_path and not pathlib.Path(mask_path).is_file():
+        print(f"warning: hot-pixel mask not found: {mask_path}", file=sys.stderr)
+        mask_path = None
+    Splay(paths, app=app, hot_pixel_mask_path=mask_path,
+          mask_on=not args.no_mask,
+          highlight=args.highlight,
+          show_strip=not args.no_thumbnails,
+          show_hud=args.hud,
+          fullscreen=args.fullscreen,
+          list_mode=not args.selected_mode,
+          source_dirs=source_dirs,
+          auto_reload=args.auto_reload).run()
 
 
 if __name__ == "__main__":
