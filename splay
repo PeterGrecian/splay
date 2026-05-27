@@ -22,6 +22,7 @@ Keys (always):
     0           fit image to window
     1           pixel-for-pixel (100%)
     2           zoomed in (200%)
+    3 / 4       FITS auto-stretch: darker / brighter (re-renders from raw)
     p           pixel data at mouse position (BGR + HSV)
     m           toggle hot-pixel mask (FITS only)
     M           toggle red highlight of hot pixels (FITS only)
@@ -194,15 +195,15 @@ def _apply_hot_pixel_mask(data, mask):
     return out
 
 
-def fits_array_to_surface(data):
-    """float32 ndarray → pygame Surface (auto-stretched greyscale)."""
+def fits_array_to_surface(data, lo_pct=0.5, hi_pct=99.5):
+    """float32 ndarray → pygame Surface (greyscale stretched lo_pct→hi_pct)."""
     import numpy as np
     finite = np.isfinite(data)
     if not finite.any():
         data8 = np.zeros(data.shape, dtype=np.uint8)
     else:
         vals = data[finite]
-        lo, hi = np.percentile(vals, [0.5, 99.5])
+        lo, hi = np.percentile(vals, [lo_pct, hi_pct])
         if hi <= lo: hi = lo + 1.0
         norm = np.clip((data - lo) / (hi - lo), 0.0, 1.0)
         norm[~finite] = 0.0
@@ -256,6 +257,33 @@ def surface_to_bgr(surf):
     arr = np.transpose(arr, (1, 0, 2))    # (H, W, 3)
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
+def disambiguated_labels(paths):
+    """Return {path -> label} where each label is the shortest trailing
+    suffix of the path that uniquely identifies it within `paths`.
+    Files with a unique basename get just the basename; files that share
+    a basename get just enough parent directories prepended."""
+    paths = list(paths)
+    parts = {p: p.parts for p in paths}
+    # Start with depth 1 (basename) for everyone.
+    depth = {p: 1 for p in paths}
+    while True:
+        # Group by the chosen suffix and bump depth on collisions.
+        groups = {}
+        for p in paths:
+            d = min(depth[p], len(parts[p]))
+            key = parts[p][-d:]
+            groups.setdefault(key, []).append(p)
+        progressed = False
+        for key, group in groups.items():
+            if len(group) <= 1: continue
+            for p in group:
+                if depth[p] < len(parts[p]):
+                    depth[p] += 1
+                    progressed = True
+        if not progressed: break
+    return {p: "/".join(parts[p][-depth[p]:]) for p in paths}
+
+
 def bgr_to_surface(bgr):
     """BGR numpy uint8 array → pygame Surface."""
     np, cv2 = _ensure_np_cv2()
@@ -284,6 +312,15 @@ class Splay:
                                     if self.hot_pixel_mask_paths else None)
         self.hot_pixel_mask_on = bool(self.hot_pixel_mask_path) and mask_on
         self.hot_pixel_highlight = highlight and bool(self.hot_pixel_mask_path)
+
+        # FITS auto-stretch percentiles. 3 = darker, 4 = brighter (see
+        # _adjust_stretch). JPEGs ignore this — they were stretched at
+        # write time and can't be recovered.
+        self.stretch_lo_pct = 0.5
+        self.stretch_hi_pct = 99.5
+
+        # Display-name disambiguation cache (path -> label).
+        self._labels = None
 
         # File-change tracking.
         self.source_dirs = list(source_dirs or [])
@@ -327,6 +364,9 @@ class Splay:
         self.processed_cache = {}  # (path, params-tuple, view) → Surface
 
         pygame.init()
+        # Enable held-key repeat so brightness/zoom nudges autorepeat
+        # like a text input: 250 ms delay, then 30 ms between repeats.
+        pygame.key.set_repeat(250, 30)
         pygame.display.set_caption(f"splay{' — ' + app.NAME if app else ''}")
         info = pygame.display.Info()
         self.window_w, self.window_h = int(info.current_w * 0.8), int(info.current_h * 0.8)
@@ -351,6 +391,15 @@ class Splay:
         self.idx = max(0, min(self.idx, len(sc) - 1))
         return sc[self.idx]
 
+    def display_name(self, path):
+        if path is None: return "—"
+        if self._labels is None:
+            self._labels = disambiguated_labels(self.paths)
+        return self._labels.get(path, path.name)
+
+    def _invalidate_labels(self):
+        self._labels = None
+
     # ---- images ----
     def load(self, path):
         if path not in self.images:
@@ -372,7 +421,8 @@ class Splay:
         mask = get_hot_pixel_mask(self.hot_pixel_mask_path) if self.hot_pixel_mask_path else None
         if self.hot_pixel_mask_on and mask is not None:
             data = _apply_hot_pixel_mask(data, mask)
-        surf = fits_array_to_surface(data)
+        surf = fits_array_to_surface(data, self.stretch_lo_pct,
+                                     self.stretch_hi_pct)
         if self.hot_pixel_highlight and mask is not None and mask.shape == data.shape:
             arr = pygame.surfarray.pixels3d(surf)  # (W, H, 3)
             mask_wh = mask.T  # to (W, H)
@@ -402,6 +452,37 @@ class Splay:
         # Only invalidate main-display surfaces — thumbnails ignore the mask.
         for p in list(self.fits_data.keys()):
             self.images.pop(p, None)
+
+    def _invalidate_all_fits_renders(self):
+        """Like _invalidate_fits_surfaces but also drops thumbnails.
+        Use for changes that affect rendering at every scale (e.g. stretch)."""
+        self._invalidate_fits_surfaces()
+        for p in list(self.fits_data.keys()):
+            self.thumbs.pop(p, None)
+
+    def adjust_stretch(self, direction):
+        """3 = darker (narrow window: raise lo, lower hi).
+        4 = brighter (widen window: lower lo, raise hi).
+        FITS only — JPEGs are pre-stretched at write time.
+        """
+        if not any(p.suffix.lower() in FITS_EXTS for p in self.paths):
+            print("stretch: no FITS files loaded (JPEGs are pre-stretched)")
+            return
+        # Step in percentile space. Asymmetric: hi moves in smaller
+        # steps because the top of the histogram is where stars live.
+        # Cap so lo stays at least 0.5% below hi (no histogram collapse).
+        GAP = 0.5
+        if direction < 0:  # darker — push lo up toward hi, pull hi down
+            self.stretch_lo_pct = min(self.stretch_lo_pct + 1.0,
+                                      self.stretch_hi_pct - GAP)
+            self.stretch_hi_pct = max(self.stretch_hi_pct - 0.2,
+                                      self.stretch_lo_pct + GAP)
+        else:              # brighter — pull lo down, push hi up
+            self.stretch_lo_pct = max(self.stretch_lo_pct - 1.0, 0.0)
+            self.stretch_hi_pct = min(self.stretch_hi_pct + 0.2, 100.0)
+        self._invalidate_all_fits_renders()
+        print(f"stretch: p{self.stretch_lo_pct:.1f} → "
+              f"p{self.stretch_hi_pct:.2f}")
 
     def _discover_masks(self, seed_path):
         """Find sibling masks matching hot-pixels-*.fits.fz next to seed_path.
@@ -435,7 +516,9 @@ class Splay:
                 try:
                     if path not in self.fits_data:
                         self.fits_data[path] = _read_fits_image(path)
-                    surf = fits_array_to_surface(self.fits_data[path])
+                    surf = fits_array_to_surface(self.fits_data[path],
+                                                 self.stretch_lo_pct,
+                                                 self.stretch_hi_pct)
                 except Exception as e:
                     print(f"thumb: failed to load {path}: {e}", file=sys.stderr)
                     return None
@@ -541,6 +624,7 @@ class Splay:
             if new_paths:
                 cur = self.curr_path
                 self.paths = sorted(self.paths + new_paths)
+                self._invalidate_labels()
                 for p in new_paths:
                     try: self.mtimes[p] = p.stat().st_mtime
                     except OSError: pass
@@ -621,6 +705,7 @@ class Splay:
             self._raise_window()
             return
         self.paths = sorted(self.paths + new_paths)
+        self._invalidate_labels()
         for p in new_paths:
             try: self.mtimes[p] = p.stat().st_mtime
             except OSError: pass
@@ -835,7 +920,7 @@ class Splay:
         sc = self.scope()
         n = len(sc)
         mode = "LIST" if self.list_mode else "SEL "
-        name = self.curr_path.name if self.curr_path else "—"
+        name = self.display_name(self.curr_path)
         sel_mark = " ★" if self.curr_path in self.selected else "  "
         bits = [f"{mode}  [{self.idx+1}/{n}]  {name}{sel_mark}",
                 f"selected:{len(self.selected)}"]
@@ -921,14 +1006,14 @@ class Splay:
             if p in self.selected:
                 pygame.draw.rect(self.screen, (100, 220, 100),
                                  (x + tw - 12, y + 2, 10, 10))
-            name = p.name
-            if len(name) > 16: name = name[:14] + "…"
+            name = self.display_name(p)
+            if len(name) > 16: name = "…" + name[-15:]
             self._draw_text((x, y + th + 2), name)
 
     def _draw_hud(self):
         sc = self.scope()
         n = len(sc)
-        frame = f"frame {self.idx+1}/{n}: {self.curr_path.name if self.curr_path else '—'}"
+        frame = f"frame {self.idx+1}/{n}: {self.display_name(self.curr_path)}"
         if self.curr_path and self.curr_path in self.images:
             iw, ih = self.images[self.curr_path].get_size()
             frame += f"  ({iw}×{ih})"
@@ -959,6 +1044,7 @@ class Splay:
             "t     toggle thumbnail strip",
             "r / R reload now / toggle auto-reload",
             "0 1 2 fit / 1:1 / 2× zoom",
+            f"3 / 4 dark/bright  p{self.stretch_lo_pct:.1f}→{self.stretch_hi_pct:.2f}",
             "p     pixel data at mouse position",
             "m / M toggle hot-pixel mask / red-highlight (FITS)",
             "z x   step through pre-generated masks",
@@ -1026,7 +1112,7 @@ class Splay:
         hh, ss, vv = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
         # Capture context: frame, mask state, and whether this pixel is a hot
         # pixel in the active mask.
-        frame_label = f"{cur.name} [{self.idx+1}/{len(self.scope())}]"
+        frame_label = f"{self.display_name(cur)} [{self.idx+1}/{len(self.scope())}]"
         if self.hot_pixel_mask_path:
             mstate = "ON" if self.hot_pixel_mask_on else "off"
             mname = self.hot_pixel_mask_path.name
@@ -1159,6 +1245,10 @@ class Splay:
                         self.zoom_mode = "1x"; self.pan_x = self.pan_y = 0
                     elif k == pygame.K_2 and not self.app:
                         self.zoom_mode = "2x"; self.pan_x = self.pan_y = 0
+                    elif k == pygame.K_3 and not self.app:
+                        self.adjust_stretch(-1)   # darker
+                    elif k == pygame.K_4 and not self.app:
+                        self.adjust_stretch(+1)   # brighter
                     elif k == pygame.K_p:
                         self.on_click(pygame.mouse.get_pos())
                     elif k == pygame.K_m:

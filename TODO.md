@@ -1,3 +1,10 @@
+needs hot key Delete which removes the file from the list
+
+
+have no wrap on stepping frames
+
+open in gimp option, might convert to .png
+
 DONE: file-change reload. 'r' rescans source dirs for new files and reloads
 any known file whose mtime changed; 'R' toggles a 1Hz auto-rescan
 (default off, --auto-reload to start it on).
