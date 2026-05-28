@@ -1,9 +1,10 @@
-needs hot key Delete which removes the file from the list
+DONE: Delete hotkey removes current file from the list (disk untouched).
 
+DONE: stepping frames no longer wraps; clamps at first/last instead.
 
-have no wrap on stepping frames
-
-open in gimp option, might convert to .png
+DONE: 'g' opens current frame in GIMP. FITS files are exported to
+~/tmp/splay-gimp/<stem>.png at the current stretch (and hot-pixel
+mask state) since GIMP's FITS support is unreliable.
 
 DONE: file-change reload. 'r' rescans source dirs for new files and reloads
 any known file whose mtime changed; 'R' toggles a 1Hz auto-rescan
