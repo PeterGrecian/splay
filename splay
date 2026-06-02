@@ -1245,25 +1245,26 @@ class Splay:
                 pos = f"  ({self.hot_pixel_mask_idx+1}/{len(self.hot_pixel_mask_paths)})"
             mask_line += f"{state}  [{n_str}]{hl}  {nm}{pos}"
         lines = [
-            "splay" + (f" — app: {self.app.NAME}" if self.app else ""),
+            "splay" + (f" — app: {self.app.NAME}" if self.app else "") + "      h = HUD",
             frame,
             f"zoom: {self.zoom_mode}    auto-reload: {'ON' if self.auto_reload else 'off'}",
             mask_line,
             "",
+            "(most keys are toggles)",
             "← →   prev / next   (Shift+← →  jump ±20)",
-            "s     select  d  deselect",
-            "l     toggle list / selected mode",
-            "w     toggle wipe between last 2 frames",
-            "f     fullscreen (image only)   h  this help",
-            "t     toggle thumbnail strip",
-            "r / R reload now / toggle auto-reload",
+            "s     select   d  deselect",
+            "l     list / selected mode",
+            "w     wipe between last 2 frames",
+            "f     fullscreen (hides thumbnail strip)",
+            "t     thumbnail strip",
+            "r / R reload now / auto-reload",
             "0 1 2 fit / 1:1 / 2× zoom",
             f"3 / 4 dark/bright  p{self.stretch_lo_pct:.1f}→{self.stretch_hi_pct:.2f}",
             "p     pixel data at mouse position",
-            "m / M toggle hot-pixel mask / red-highlight (FITS)",
+            "m / M hot-pixel mask / red-highlight (FITS)",
             "z x   step through pre-generated masks",
             "g     open in GIMP   Del  remove from list",
-            f"o     toggle .reg overlay ({'on' if self.show_regions else 'off'})",
+            f"o     .reg overlay ({'on' if self.show_regions else 'off'})",
             "L-drag pan when zoomed",
             "q     quit   Esc  minimise   (Ctrl-C also quits)",
         ]
@@ -1280,10 +1281,11 @@ class Splay:
             ]
         pad = 14
         line_h = 20
-        box_w = 420
+        text_w = max((self.font_big.size(line)[0] for line in lines), default=0)
+        box_w = text_w + pad * 2
         box_h = pad * 2 + line_h * len(lines)
         ww, wh = self.screen.get_size()
-        bx = ww - box_w - 20
+        bx = max(20, ww - box_w - 20)
         by = 40
         s = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
         s.fill((0, 0, 0, 200))
@@ -1425,20 +1427,42 @@ class Splay:
         def _on_sigint(signum, frame):
             self._sigint = True
         signal.signal(signal.SIGINT, _on_sigint)
-        clock = pygame.time.Clock()
+        # Event-driven loop: block on pygame.event.wait() so the process is
+        # idle when nothing is happening. A short timeout lets us still tick
+        # IPC drain, SIGINT check, and auto-reload. Only redraw when an event
+        # was handled or a periodic action fired — not 60× per second.
+        IDLE_TIMEOUT_MS = 250
+        ACTIVE_TIMEOUT_MS = 16  # ~60 fps while events are flowing (drag, wipe)
         while running:
             if self._sigint:
                 print("\nCtrl-C — exiting")
                 break
+            paths_before = len(self.paths)
+            idx_before = self.idx
             self._drain_ipc()
+            need_redraw = (len(self.paths) != paths_before or
+                           self.idx != idx_before)
             if self.auto_reload and time.monotonic() - self.last_auto_scan >= 1.0:
                 self.last_auto_scan = time.monotonic()
                 self.reload_changed(verbose=False)
-            for ev in pygame.event.get():
+                need_redraw = True
+            timeout = ACTIVE_TIMEOUT_MS if self.dragging or self.wipe_on or (self.app and self.view == VIEW_WIPE) else IDLE_TIMEOUT_MS
+            first = pygame.event.wait(timeout)
+            events = [first] if first.type != pygame.NOEVENT else []
+            events.extend(pygame.event.get())
+            if events:
+                need_redraw = True
+            for ev in events:
                 if ev.type == pygame.QUIT:
                     running = False
                 elif ev.type == pygame.VIDEORESIZE:
-                    self.screen = pygame.display.set_mode((ev.w, ev.h), pygame.RESIZABLE)
+                    # On SDL2 the display surface tracks the window automatically;
+                    # re-calling set_mode mid-drag can abort the live resize. Just
+                    # refresh our handle and remember the new size for fullscreen
+                    # round-trips.
+                    self.window_w, self.window_h = ev.w, ev.h
+                    if not self.fullscreen:
+                        self.screen = pygame.display.get_surface()
                 elif ev.type == pygame.MOUSEMOTION and self.wipe_on:
                     self.wipe_x = ev.pos[0]
                 elif ev.type == pygame.MOUSEMOTION and self.app and self.view == VIEW_WIPE:
@@ -1545,8 +1569,8 @@ class Splay:
                             self.undo()
                     elif self.app and k == pygame.K_r and (mods & pygame.KMOD_CTRL):
                         self.render_now()
-            self.draw()
-            clock.tick(60)
+            if need_redraw:
+                self.draw()
         pygame.quit()
         if self._ipc_sock is not None:
             try: self._ipc_sock.close()
