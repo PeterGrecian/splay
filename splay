@@ -53,13 +53,25 @@ import pygame
 import colorsys
 
 
-SPLAY_SOCKET_PATH = f"/tmp/splay-{os.environ.get('USER', 'user')}.sock"
+def _splay_socket_path():
+    # Prefer $XDG_RUNTIME_DIR (/run/user/$UID) — per-user, not subject to
+    # systemd-tmpfiles cleaning of /tmp, which previously could remove the
+    # bound socket file mid-session and break IPC handoff.
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and os.path.isdir(runtime):
+        return os.path.join(runtime, "splay.sock")
+    return f"/tmp/splay-{os.environ.get('USER', 'user')}.sock"
+
+
+SPLAY_SOCKET_PATH = _splay_socket_path()
 
 
 def send_to_running_instance(abs_paths):
     """Try to deliver a list of absolute paths to a running splay.
     Returns True if delivered, False if no instance is listening."""
     if not os.path.exists(SPLAY_SOCKET_PATH):
+        print(f"splay: no running instance (socket {SPLAY_SOCKET_PATH} absent)",
+              file=sys.stderr)
         return False
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -69,7 +81,9 @@ def send_to_running_instance(abs_paths):
         s.sendall(msg.encode())
         s.close()
         return True
-    except (OSError, socket.timeout):
+    except (OSError, socket.timeout) as e:
+        print(f"splay: IPC handoff failed ({e}); unlinking stale socket "
+              f"{SPLAY_SOCKET_PATH}", file=sys.stderr)
         try: os.unlink(SPLAY_SOCKET_PATH)  # stale
         except OSError: pass
         return False
@@ -824,9 +838,18 @@ class Splay:
             self._ipc_sock.bind(SPLAY_SOCKET_PATH)
             self._ipc_sock.listen(4)
         except OSError as e:
-            print(f"warning: IPC listener disabled: {e}", file=sys.stderr)
+            # Loud: silent IPC failure was the prior bug — without a listener,
+            # every subsequent xdg-open / 'splay <path>' spawns a new window.
+            print("=" * 60, file=sys.stderr)
+            print(f"splay: IPC LISTENER DISABLED on {SPLAY_SOCKET_PATH}",
+                  file=sys.stderr)
+            print(f"splay: cause: {e}", file=sys.stderr)
+            print("splay: single-instance handoff will not work; "
+                  "xdg-open will spawn new windows.", file=sys.stderr)
+            print("=" * 60, file=sys.stderr)
             self._ipc_sock = None
             return
+        print(f"splay: IPC listening on {SPLAY_SOCKET_PATH}", file=sys.stderr)
         t = threading.Thread(target=self._ipc_serve_loop, daemon=True)
         t.start()
 
