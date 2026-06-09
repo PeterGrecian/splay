@@ -13,6 +13,8 @@ Keys (always):
     s           select current frame
     d           deselect current frame
     l           toggle list mode / selected-only mode
+    a           cycle sort: name (alphanumeric) → age (mtime, newest first)
+                  → added (load/discovery order, newest first)
     w           toggle wipe between two most recently shown frames
     f           toggle fullscreen (image only — no overlay; HUD via h)
     h           toggle HUD / help
@@ -421,7 +423,17 @@ class Splay:
                  source_dirs=None, auto_reload=False):
         if not paths:
             sys.exit("no images")
-        self.paths = paths
+        # Sort state. Modes: "name" (alphanumeric asc, default), "mtime"
+        # (file mtime, newest first), "added" (order splay first saw the
+        # path, newest first). _added_seq is a monotonic counter so that
+        # files appearing in the same reload tick get a stable order.
+        self.sort_mode = "name"
+        self._added_seq = 0
+        self.added_order = {}  # path -> int (insertion sequence)
+        for p in paths:
+            self.added_order[p] = self._added_seq
+            self._added_seq += 1
+        self.paths = self._sort_paths(paths)
         self.images = {}     # path -> pygame.Surface (lazy)
         self.fits_data = {}  # path -> raw float32 ndarray (FITS only)
         self.thumbs = {}
@@ -498,6 +510,40 @@ class Splay:
         self.font = pygame.font.SysFont("monospace", 14)
         self.font_big = pygame.font.SysFont("monospace", 16)
         self._show_current()
+
+    # ---- sort ----
+    SORT_MODES = ("name", "mtime", "added")
+    SORT_LABELS = {"name": "name", "mtime": "age", "added": "added"}
+
+    def _sort_paths(self, paths):
+        """Return `paths` ordered per current sort_mode. Stable across
+        reloads so the user's position doesn't jitter between ticks."""
+        if self.sort_mode == "mtime":
+            def key(p):
+                m = self.mtimes.get(p)
+                if m is None:
+                    try: m = p.stat().st_mtime
+                    except OSError: m = 0.0
+                # Newest first; tiebreak by name for determinism.
+                return (-m, str(p))
+            return sorted(paths, key=key)
+        if self.sort_mode == "added":
+            # Newest-added first; unknown (shouldn't happen) sinks to end.
+            return sorted(paths, key=lambda p: (-self.added_order.get(p, -1),
+                                                str(p)))
+        return sorted(paths)
+
+    def cycle_sort_mode(self):
+        cur = self.curr_path
+        i = self.SORT_MODES.index(self.sort_mode)
+        self.sort_mode = self.SORT_MODES[(i + 1) % len(self.SORT_MODES)]
+        self.paths = self._sort_paths(self.paths)
+        sc = self.scope()
+        if cur and cur in sc:
+            self.idx = sc.index(cur)
+        else:
+            self.idx = 0
+        print(f"sort: {self.SORT_LABELS[self.sort_mode]}")
 
     # ---- scope ----
     def scope(self):
@@ -806,11 +852,14 @@ class Splay:
                     continue
             if new_paths:
                 cur = self.curr_path
-                self.paths = sorted(self.paths + new_paths)
-                self._invalidate_labels()
+                for p in new_paths:
+                    self.added_order[p] = self._added_seq
+                    self._added_seq += 1
                 for p in new_paths:
                     try: self.mtimes[p] = p.stat().st_mtime
                     except OSError: pass
+                self.paths = self._sort_paths(self.paths + new_paths)
+                self._invalidate_labels()
                 added = len(new_paths)
                 # Preserve current frame position.
                 sc = self.scope()
@@ -900,11 +949,14 @@ class Splay:
         if not new_paths:
             self._raise_window()
             return
-        self.paths = sorted(self.paths + new_paths)
-        self._invalidate_labels()
+        for p in new_paths:
+            self.added_order[p] = self._added_seq
+            self._added_seq += 1
         for p in new_paths:
             try: self.mtimes[p] = p.stat().st_mtime
             except OSError: pass
+        self.paths = self._sort_paths(self.paths + new_paths)
+        self._invalidate_labels()
         # Jump to the first newly-added path.
         first = new_paths[0]
         sc = self.scope()
@@ -1160,7 +1212,8 @@ class Splay:
         name = self.display_name(self.curr_path)
         sel_mark = " ★" if self.curr_path in self.selected else "  "
         bits = [f"{mode}  [{self.idx+1}/{n}]  {name}{sel_mark}",
-                f"selected:{len(self.selected)}"]
+                f"selected:{len(self.selected)}",
+                f"sort:{self.SORT_LABELS[self.sort_mode]}"]
         if self.wipe_on and not self.app: bits.append("WIPE")
         if self.app:
             bits.append(f"app:{self.app.NAME}  view:{VIEW_NAMES[self.view]}")
@@ -1277,6 +1330,7 @@ class Splay:
             "← →   prev / next   (Shift+← →  jump ±20)",
             "s     select   d  deselect",
             "l     list / selected mode",
+            f"a     sort: name / age / added  (now: {self.SORT_LABELS[self.sort_mode]})",
             "w     wipe between last 2 frames",
             "f     fullscreen (hides thumbnail strip)",
             "t     thumbnail strip",
@@ -1547,6 +1601,8 @@ class Splay:
                     elif k == pygame.K_w:
                         mx, _ = pygame.mouse.get_pos()
                         self.toggle_wipe(mx)
+                    elif not self.app and k == pygame.K_a:
+                        self.cycle_sort_mode()
                     elif k == pygame.K_h:
                         self.show_hud = not self.show_hud
                     elif k == pygame.K_t:
