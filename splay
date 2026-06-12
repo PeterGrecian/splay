@@ -42,10 +42,12 @@ Keys (in --app mode):
     , .         cycle which app parameter is active
     [ ]         decrement / increment active parameter by step
     { }         decrement / increment by 10× step
-    0           reset active parameter to default
-    Shift+0     reset all parameters to defaults
+    0           toggle active parameter between current and default (A/B)
+    Shift+0     toggle ALL parameters between current and defaults (A/B)
     z / Z       undo / redo a parameter change (clicks + key adjustments)
     Ctrl+R      open render-now dialog with current parameters
+    Ctrl+S      save current parameters to a sidecar (plugin-defined)
+                — sidecar is auto-loaded when the image is reopened
 """
 
 import argparse, importlib.util, os, pathlib, sys, copy
@@ -476,6 +478,14 @@ class Splay:
         self.wipe_x = None
         self.show_hud = show_hud
         self.show_strip = show_strip
+        self._thumbs_pending = False  # set by _draw_strip when off-screen lookahead remains
+        # Set of keys currently physically held. Used to suppress key-repeat
+        # KEYDOWN events for keys that should fire once per press (e.g. p,
+        # s, d). Only keys in AUTOREPEAT_KEYS are allowed to fire on repeat.
+        self._keys_held = set()
+        # Pixel probe cycles: "off" → "snapshot" (one-shot print + on-screen)
+        # → "live" (follows the mouse, no console spam) → "off".
+        self.pixel_probe_mode = "off"
         self.show_regions = show_regions
         self.fullscreen = fullscreen
         self.zoom_mode = "fit"   # "fit", "1x", "2x"
@@ -497,8 +507,10 @@ class Splay:
 
         pygame.init()
         # Enable held-key repeat so brightness/zoom nudges autorepeat
-        # like a text input: 250 ms delay, then 30 ms between repeats.
-        pygame.key.set_repeat(250, 30)
+        # like a text input. The initial delay needs to be long enough that
+        # an ordinary tap on the arrow keys can't sneak in a second event —
+        # 250 ms was too short and produced occasional double-steps.
+        pygame.key.set_repeat(500, 40)
         pygame.display.set_caption(f"splay{' — ' + app.NAME if app else ''}")
         info = pygame.display.Info()
         self.window_w, self.window_h = int(info.current_w * 0.8), int(info.current_h * 0.8)
@@ -740,6 +752,23 @@ class Splay:
         if cur != self.curr_path:
             self.prev_path = self.curr_path
             self.curr_path = cur
+            # Plugin hook: a sidecar file of saved params might live next to
+            # the new image. If the plugin defines on_open(), let it return
+            # a partial dict to merge into the current params.
+            if self.app and hasattr(self.app, "on_open"):
+                try:
+                    update = self.app.on_open(self.curr_path)
+                except Exception as e:
+                    print(f"app.on_open() raised: {e}")
+                    update = None
+                if update:
+                    self._push_undo()
+                    for k, v in update.items():
+                        if k in self.params:
+                            self.params[k] = v
+                    self._invalidate_processed()
+                    print(f"{self.app.NAME}: loaded {len(update)} param(s) "
+                          f"from sidecar")
 
     def next(self, delta):
         sc = self.scope()
@@ -861,9 +890,20 @@ class Splay:
                 self.paths = self._sort_paths(self.paths + new_paths)
                 self._invalidate_labels()
                 added = len(new_paths)
-                # Preserve current frame position.
                 sc = self.scope()
-                if cur and cur in sc:
+                # When auto-reload is on, jump to the newest arrival (by
+                # mtime, with name tiebreak) so the user sees fresh frames
+                # as they appear. When off (manual 'r'), preserve position
+                # and just let the thumbnails fill in.
+                if self.auto_reload:
+                    def _mt(p):
+                        try: return p.stat().st_mtime
+                        except OSError: return 0.0
+                    newest = max(new_paths, key=lambda p: (_mt(p), str(p)))
+                    if newest in sc:
+                        self.idx = sc.index(newest)
+                        self._show_current()
+                elif cur and cur in sc:
                     self.idx = sc.index(cur)
         # 2. Check mtimes on already-loaded paths.
         for p in list(self.mtimes):
@@ -1033,16 +1073,36 @@ class Splay:
         self.active_param_idx = (self.active_param_idx + delta) % len(self.param_keys)
 
     def reset_active_param(self):
+        """Toggle: if current value != default, snap to default and
+        remember the previous; if current == default, restore the
+        last non-default value. Lets you A/B-compare with one key."""
         if not self.app: return
         k = self.param_keys[self.active_param_idx]
         self._push_undo()
-        self.params[k] = self.app._defaults[k]
+        default = self.app._defaults[k]
+        if not hasattr(self, "_toggle_stash"):
+            self._toggle_stash = {}
+        cur = self.params[k]
+        if cur != default:
+            self._toggle_stash[k] = cur
+            self.params[k] = default
+        elif k in self._toggle_stash:
+            self.params[k] = self._toggle_stash[k]
         self._invalidate_processed()
 
     def reset_all_params(self):
+        """Toggle: snap every param to defaults; press again to
+        restore the last snapshot of non-default values."""
         if not self.app: return
         self._push_undo()
-        self.params = dict(self.app._defaults)
+        defaults = dict(self.app._defaults)
+        if not hasattr(self, "_toggle_stash_all"):
+            self._toggle_stash_all = None
+        if self.params != defaults:
+            self._toggle_stash_all = dict(self.params)
+            self.params = defaults
+        elif self._toggle_stash_all is not None:
+            self.params = dict(self._toggle_stash_all)
         self._invalidate_processed()
 
     def undo(self):
@@ -1063,6 +1123,32 @@ class Splay:
         show_strip = self.show_strip and not self.fullscreen
         strip_h = THUMB_H + 24 if show_strip else 0
         return pygame.Rect(0, 0, ww, max(1, wh - strip_h))
+
+    def _set_zoom(self, mode, anchor):
+        """Switch zoom mode while keeping the image pixel under `anchor`
+        (screen-space x, y) pinned in place. For 'fit', pan is always 0."""
+        surf = self.load(self.curr_path) if self.curr_path else None
+        if surf is None or mode == self.zoom_mode:
+            self.zoom_mode = mode
+            if mode == "fit":
+                self.pan_x = self.pan_y = 0
+            return
+        old = self.image_blit_rect(surf)
+        iw, ih = surf.get_width(), surf.get_height()
+        mx, my = anchor
+        if not old.collidepoint(mx, my):
+            mx, my = old.centerx, old.centery
+        img_px = (mx - old.x) * iw / old.w
+        img_py = (my - old.y) * ih / old.h
+        self.zoom_mode = mode
+        if mode == "fit":
+            self.pan_x = self.pan_y = 0
+            return
+        self.pan_x = self.pan_y = 0
+        base = self.image_blit_rect(surf)  # centred, pan=0
+        new_w, new_h = base.w, base.h
+        self.pan_x = int(round(mx - base.x - img_px * new_w / iw))
+        self.pan_y = int(round(my - base.y - img_py * new_h / ih))
 
     def image_blit_rect(self, surf):
         area = self.display_area()
@@ -1115,8 +1201,12 @@ class Splay:
         if not self.fullscreen:
             if self.show_strip: self._draw_strip()
             self._draw_status()
-            if self.app: self._draw_params_panel()
             if self.click_info: self._draw_click_info()
+        # Params panel is the only way to see + drive plugin state, so
+        # it renders even in fullscreen — otherwise a plugin in
+        # fullscreen is blind. Plugins without state have no panel
+        # anyway.
+        if self.app: self._draw_params_panel()
         if self.show_hud: self._draw_hud()
         pygame.display.flip()
 
@@ -1262,24 +1352,32 @@ class Splay:
         self.screen.blit(bar, (0, strip_y))
         sc = self.scope()
         if not sc: return
-        # Strip rendering: only build at most one *new* thumbnail per draw,
-        # and never build thumbs more than WINDOW frames from idx. This keeps
-        # the UI responsive even on huge FITS dirs where each decode is slow.
-        WINDOW = 10
-        MAX_NEW_PER_FRAME = 1
+        # Strip rendering: build thumbs for every on-screen slot in this
+        # draw (the user is looking at them) plus a small lookahead either
+        # side, built one-per-draw with the main loop polled to keep coming
+        # back until done. This keeps the UI responsive on huge FITS dirs.
+        LOOKAHEAD = 2
         nom_w = THUMB_H * 2  # placeholder width for unloaded thumbs
         slot_w = nom_w + 8
         offset_x = ww // 2 - (self.idx * slot_w + slot_w // 2)
         y = strip_y + 4
-        new_built = 0
+        self._thumbs_pending = False
+        lookahead_budget = 1  # one off-screen thumb per draw, so we drift outward
         for i, p in enumerate(sc):
             x = offset_x + i * slot_w
-            if x + slot_w < 0 or x > ww:
+            on_screen = not (x + slot_w < 0 or x > ww)
+            if not on_screen:
+                # Pre-build a couple of slots either side so paging is smooth.
+                if abs(i - self.idx) <= LOOKAHEAD and p not in self.thumbs:
+                    if lookahead_budget > 0:
+                        self.thumb(p)
+                        lookahead_budget -= 1
+                    else:
+                        self._thumbs_pending = True
                 continue
             t = self.thumbs.get(p)
-            if t is None and abs(i - self.idx) <= WINDOW and new_built < MAX_NEW_PER_FRAME:
+            if t is None:
                 t = self.thumb(p)
-                new_built += 1
             if t is None:
                 pygame.draw.rect(self.screen, (40, 40, 40),
                                  (x, y, nom_w, THUMB_H), 0)
@@ -1352,7 +1450,7 @@ class Splay:
                 "o      cycle view (input/wipe/output/mask)",
                 ", .    cycle active parameter",
                 "[ ]    decr / incr by step   { }  by 10× step",
-                "0      reset active param   Shift+0  reset all",
+                "0      toggle active to/from default   Shift+0  toggle all",
                 "z Z    undo / redo",
                 "Ctrl+R render full clip (confirms)",
             ]
@@ -1389,14 +1487,17 @@ class Splay:
         self._draw_text((10, 71), line2, colour=col)
 
     # ---- input ----
-    def on_click(self, screen_pos):
+    def on_click(self, screen_pos, quiet=False):
         cur = self.curr_path
         if not cur: return
         surf = self.load(cur)
         if surf is None: return
         target = self.image_blit_rect(surf)
         sx, sy = screen_pos
-        if not target.collidepoint(sx, sy): return
+        if not target.collidepoint(sx, sy):
+            if quiet:
+                self.click_info = None
+            return
         u = (sx - target.x) / target.w
         v = (sy - target.y) / target.h
         iw, ih = surf.get_size()
@@ -1421,12 +1522,13 @@ class Splay:
                 is_hot = bool(m[iy, ix])
         self.click_info = (ix, iy, (b, g, r), (hh, ss, vv),
                            frame_label, mask_label, is_hot)
-        hot_tag = ""
-        if is_hot is True: hot_tag = "  HOT"
-        elif is_hot is False: hot_tag = "  (not hot)"
-        print(f"  {frame_label}  {mask_label}{hot_tag}")
-        print(f"  ({ix},{iy})  RGB=({r},{g},{b})  "
-              f"HSV=({int(hh*180)},{int(ss*255)},{int(vv*255)})")
+        if not quiet:
+            hot_tag = ""
+            if is_hot is True: hot_tag = "  HOT"
+            elif is_hot is False: hot_tag = "  (not hot)"
+            print(f"  {frame_label}  {mask_label}{hot_tag}")
+            print(f"  ({ix},{iy})  RGB=({r},{g},{b})  "
+                  f"HSV=({int(hh*180)},{int(ss*255)},{int(vv*255)})")
 
         # In app mode, give the app a chance to update params.
         if self.app and hasattr(self.app, "on_click"):
@@ -1521,9 +1623,19 @@ class Splay:
                            self.idx != idx_before)
             if self.auto_reload and time.monotonic() - self.last_auto_scan >= 1.0:
                 self.last_auto_scan = time.monotonic()
-                self.reload_changed(verbose=False)
+                added, changed = self.reload_changed(verbose=False)
+                if added or changed:
+                    need_redraw = True
+            if self.dragging or self.wipe_on or (self.app and self.view == VIEW_WIPE):
+                timeout = ACTIVE_TIMEOUT_MS
+            elif self._thumbs_pending:
+                # Off-screen lookahead thumbs to build — wake soon and redraw.
+                # 30 ms is fast enough to feel instant for the user but slow
+                # enough that we don't burn a CPU spinning the redraw loop.
+                timeout = 30
                 need_redraw = True
-            timeout = ACTIVE_TIMEOUT_MS if self.dragging or self.wipe_on or (self.app and self.view == VIEW_WIPE) else IDLE_TIMEOUT_MS
+            else:
+                timeout = IDLE_TIMEOUT_MS
             first = pygame.event.wait(timeout)
             events = [first] if first.type != pygame.NOEVENT else []
             events.extend(pygame.event.get())
@@ -1544,6 +1656,8 @@ class Splay:
                     self.wipe_x = ev.pos[0]
                 elif ev.type == pygame.MOUSEMOTION and self.app and self.view == VIEW_WIPE:
                     self.wipe_x = ev.pos[0]
+                elif ev.type == pygame.MOUSEMOTION and self.pixel_probe_mode == "live" and not self.dragging:
+                    self.on_click(ev.pos, quiet=True)
                 elif ev.type == pygame.MOUSEMOTION and self.dragging:
                     dx = ev.pos[0] - self.drag_last[0]
                     dy = ev.pos[1] - self.drag_last[1]
@@ -1560,25 +1674,45 @@ class Splay:
                         self.drag_last = ev.pos
                 elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
                     self.dragging = False
+                elif ev.type == pygame.KEYUP:
+                    self._keys_held.discard(ev.key)
                 elif ev.type == pygame.KEYDOWN:
                     k = ev.key
                     mods = pygame.key.get_mods()
+                    # Suppress key-repeat for keys that should fire once per
+                    # press. Only stretch/param nudges autorepeat.
+                    AUTOREPEAT_KEYS = {pygame.K_3, pygame.K_4,
+                                       pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET,
+                                       pygame.K_COMMA, pygame.K_PERIOD}
+                    if k in self._keys_held and k not in AUTOREPEAT_KEYS:
+                        continue
+                    self._keys_held.add(k)
                     if k == pygame.K_ESCAPE:
                         pygame.display.iconify()
                     elif k == pygame.K_q:
                         running = False
                     elif k == pygame.K_0 and not self.app:
-                        self.zoom_mode = "fit"; self.pan_x = self.pan_y = 0
+                        self._set_zoom("fit", pygame.mouse.get_pos())
                     elif k == pygame.K_1 and not self.app:
-                        self.zoom_mode = "1x"; self.pan_x = self.pan_y = 0
+                        self._set_zoom("1x", pygame.mouse.get_pos())
                     elif k == pygame.K_2 and not self.app:
-                        self.zoom_mode = "2x"; self.pan_x = self.pan_y = 0
+                        self._set_zoom("2x", pygame.mouse.get_pos())
                     elif k == pygame.K_3 and not self.app:
                         self.adjust_stretch(-1)   # darker
                     elif k == pygame.K_4 and not self.app:
                         self.adjust_stretch(+1)   # brighter
                     elif k == pygame.K_p:
-                        self.on_click(pygame.mouse.get_pos())
+                        if self.pixel_probe_mode == "off":
+                            self.pixel_probe_mode = "snapshot"
+                            self.on_click(pygame.mouse.get_pos())
+                        elif self.pixel_probe_mode == "snapshot":
+                            self.pixel_probe_mode = "live"
+                            self.on_click(pygame.mouse.get_pos(), quiet=True)
+                            print("pixel probe: live")
+                        else:
+                            self.pixel_probe_mode = "off"
+                            self.click_info = None
+                            print("pixel probe: off")
                     elif k == pygame.K_m:
                         if mods & pygame.KMOD_SHIFT:
                             self.toggle_hot_pixel_highlight()
@@ -1648,6 +1782,17 @@ class Splay:
                             self.undo()
                     elif self.app and k == pygame.K_r and (mods & pygame.KMOD_CTRL):
                         self.render_now()
+                    elif self.app and k == pygame.K_s and (mods & pygame.KMOD_CTRL):
+                        # Plugin hook: save current params via on_save().
+                        # Distinct from Ctrl-R (render submission) so each
+                        # has a clear purpose.
+                        if hasattr(self.app, "on_save") and self.curr_path:
+                            try:
+                                msg = self.app.on_save(
+                                    self.curr_path, dict(self.params))
+                            except Exception as e:
+                                msg = f"on_save failed: {e}"
+                            print(msg or "saved")
             if need_redraw:
                 self.draw()
         pygame.quit()
@@ -1746,9 +1891,15 @@ def main():
         sys.exit("no images found")
     print(f"loaded {len(paths)} image(s). h = help.")
     mask_path = args.hot_pixel_mask or None
-    if mask_path and not pathlib.Path(mask_path).is_file():
-        print(f"warning: hot-pixel mask not found: {mask_path}", file=sys.stderr)
-        mask_path = None
+    if mask_path:
+        try:
+            ok = pathlib.Path(mask_path).is_file()
+        except OSError as e:
+            print(f"warning: hot-pixel mask unreachable ({e}): {mask_path}",
+                  file=sys.stderr)
+            ok = False
+        if not ok:
+            mask_path = None
     Splay(paths, app=app, hot_pixel_mask_path=mask_path,
           mask_on=not args.no_mask,
           highlight=args.highlight,
@@ -1758,7 +1909,9 @@ def main():
           list_mode=not args.selected_mode,
           show_regions=not args.no_regions,
           source_dirs=source_dirs,
-          auto_reload=args.auto_reload).run()
+          # If a directory was passed on the command line, default to
+          # auto-reload so new frames written into it appear. Toggle with 'R'.
+          auto_reload=args.auto_reload or bool(source_dirs)).run()
 
 
 if __name__ == "__main__":
