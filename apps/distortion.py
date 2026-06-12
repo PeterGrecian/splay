@@ -52,8 +52,11 @@ PARAMS = {
     # View toggle (image vs polar) — integer 0/1 for slider compatibility.
     "view":       (0,       1,      0,      1,     "int"),
     # Grid spacing for the overlay (in pixels in image view, in
-    # radial-pixels in polar view). 0 = no grid.
-    "grid":       (0,       400,    80,     20,    "int"),
+    # radial-pixels in polar view). Step size is independent of
+    # visibility: cycle to `grid_show` and press 0 to toggle.
+    "grid":       (20,      400,    80,     20,    "int"),
+    # Show/hide the grid overlay. 0 = hide, 1 = show. Default visible.
+    "grid_show":  (0,       1,      1,      1,     "int"),
     # Stretch (asinh strength) — controls how much faint trail signal
     # is pulled out of the dark sky.
     "stretch":    (1.0,     200.0,  30.0,   2.0,   "float"),
@@ -69,7 +72,7 @@ def _params_key(p):
     return tuple(round(float(p[k]), 6) for k in
                  ("pole_x", "pole_y", "cx", "cy",
                   "k1", "k2", "p1", "p2",
-                  "view", "grid", "stretch"))
+                  "view", "grid", "grid_show", "stretch"))
 
 
 def _to_grey(bgr):
@@ -126,6 +129,8 @@ def _to_polar(grey, pole_x, pole_y):
 def _draw_grid_image(bgr, p):
     """Concentric circles + radial spokes around the pole, drawn as a
     faint overlay. Radial step = grid pixels."""
+    if not int(p.get("grid_show", 1)):
+        return bgr
     step = int(p["grid"])
     if step <= 0:
         return bgr
@@ -148,6 +153,8 @@ def _draw_grid_image(bgr, p):
 def _draw_grid_polar(bgr, p, max_r):
     """Horizontal lines at constant radius, vertical lines at constant
     angle. Star trails should sit ON the horizontals."""
+    if not int(p.get("grid_show", 1)):
+        return bgr
     step = int(p["grid"])
     if step <= 0:
         return bgr
