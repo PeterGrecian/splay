@@ -1659,6 +1659,7 @@ class Splay:
                 break
             paths_before = len(self.paths)
             idx_before = self.idx
+            self._advanced_this_batch = False  # transport: see ADVANCE_EVENT
             self._drain_ipc()
             need_redraw = (len(self.paths) != paths_before or
                            self.idx != idx_before)
@@ -1716,8 +1717,17 @@ class Splay:
                 elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
                     self.dragging = False
                 elif ev.type == ADVANCE_EVENT:
-                    if self.playing:
+                    # Coalesce: if many ADVANCE_EVENTs were queued while
+                    # we were busy (e.g. decoding a slow frame), advance
+                    # by ONE total — not one per queued event. Otherwise
+                    # the display would visibly skip many frames between
+                    # paints when decode falls behind.
+                    if self.playing and not self._advanced_this_batch:
+                        self._advanced_this_batch = True
                         self.play_advance()
+                        # Drop any further ADVANCE_EVENTs queued behind
+                        # this one — they'd just trigger more skips.
+                        pygame.event.clear(ADVANCE_EVENT)
                 elif ev.type == pygame.KEYUP:
                     self._keys_held.discard(ev.key)
                 elif ev.type == pygame.KEYDOWN:
