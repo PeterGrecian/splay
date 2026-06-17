@@ -426,7 +426,9 @@ class Splay:
                  mask_on=True, highlight=False,
                  show_strip=True, show_hud=False, fullscreen=False,
                  list_mode=True, show_regions=True,
-                 source_dirs=None, auto_reload=False):
+                 source_dirs=None, auto_reload=False,
+                 no_autoplay=False):
+        self._no_autoplay = no_autoplay
         if not paths:
             sys.exit("no images")
         # Sort state. Modes: "name" (alphanumeric asc, default), "mtime"
@@ -545,6 +547,11 @@ class Splay:
         self.font = pygame.font.SysFont("monospace", 14)
         self.font_big = pygame.font.SysFont("monospace", 16)
         self._show_current()
+        # Auto-start playing — what the operator almost always wants when
+        # asking splay to look at a frame sequence. Space pauses; , .
+        # change direction; q quits. Disable with --no-autoplay.
+        if not getattr(self, "_no_autoplay", False) and len(self.paths) > 1:
+            self.toggle_play()
 
     # ---- sort ----
     SORT_MODES = ("name", "mtime", "added")
@@ -2010,6 +2017,9 @@ def main():
                     help="always spawn a new splay process. Without this flag, "
                          "if a splay is already running it receives the "
                          "files/dirs and is raised to the foreground.")
+    ap.add_argument("--no-autoplay", action="store_true",
+                    help="don't auto-start playing on launch. By default, "
+                         "splay starts playing a sequence (Space pauses).")
     args = ap.parse_args()
 
     if args.list_apps:
@@ -2058,7 +2068,8 @@ def main():
           source_dirs=source_dirs,
           # If a directory was passed on the command line, default to
           # auto-reload so new frames written into it appear. Toggle with 'R'.
-          auto_reload=args.auto_reload or bool(source_dirs)).run()
+          auto_reload=args.auto_reload or bool(source_dirs),
+          no_autoplay=args.no_autoplay).run()
 
 
 if __name__ == "__main__":
