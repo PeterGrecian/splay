@@ -452,6 +452,10 @@ class Splay:
         self.playing = False
         self.play_dir = +1
         self.play_fps = 60
+        # Rolling window of recent paint timestamps for fps readout.
+        # _show_current() appends; HUD reads len / window_seconds.
+        from collections import deque
+        self._paint_times = deque(maxlen=240)  # ~4s of headroom at 60fps
         self.hot_pixel_mask_paths = self._discover_masks(hot_pixel_mask_path)
         self.hot_pixel_mask_idx = 0
         self.hot_pixel_mask_path = (self.hot_pixel_mask_paths[0]
@@ -763,6 +767,7 @@ class Splay:
             self.curr_path = None
             return
         if cur != self.curr_path:
+            self._paint_times.append(time.monotonic())
             self.prev_path = self.curr_path
             self.curr_path = cur
             # Plugin hook: a sidecar file of saved params might live next to
@@ -1345,6 +1350,13 @@ class Splay:
         bits = [f"{mode}  [{self.idx+1}/{n}]  {name}{sel_mark}",
                 f"selected:{len(self.selected)}",
                 f"sort:{self.SORT_LABELS[self.sort_mode]}"]
+        if self.playing:
+            # fps = paints in the last 1s. _paint_times appended in
+            # _show_current each time a new frame is actually shown.
+            now = time.monotonic()
+            recent = [t for t in self._paint_times if now - t <= 1.0]
+            fps = len(recent)
+            bits.append(f"play:{self.play_dir:+d}  {fps} fps")
         if self.wipe_on and not self.app: bits.append("WIPE")
         if self.app:
             bits.append(f"app:{self.app.NAME}  view:{VIEW_NAMES[self.view]}")
