@@ -427,8 +427,10 @@ class Splay:
                  show_strip=True, show_hud=False, fullscreen=False,
                  list_mode=True, show_regions=True,
                  source_dirs=None, auto_reload=False,
-                 no_autoplay=False):
+                 no_autoplay=False, print_fps=False):
         self._no_autoplay = no_autoplay
+        self._print_fps = print_fps
+        self._last_fps_print = 0.0
         if not paths:
             sys.exit("no images")
         # Sort state. Modes: "name" (alphanumeric asc, default), "mtime"
@@ -862,6 +864,16 @@ class Splay:
         n = len(sc)
         self.idx = (self.idx + self.play_dir) % n
         self._show_current()
+        # --print-fps: emit one fps line per second to stdout for
+        # headless tests and to watch the first-pass → second-pass cache
+        # speedup land in real time.
+        if self._print_fps:
+            now = time.monotonic()
+            if now - self._last_fps_print >= 1.0:
+                recent = [t for t in self._paint_times if now - t <= 1.0]
+                print(f"fps: {len(recent):3d}  frame {self.idx+1}/{n}  "
+                      f"dir={self.play_dir:+d}", flush=True)
+                self._last_fps_print = now
 
     def toggle_play(self):
         """Space = play/pause. Starts the ADVANCE_EVENT timer at the
@@ -2020,6 +2032,11 @@ def main():
     ap.add_argument("--no-autoplay", action="store_true",
                     help="don't auto-start playing on launch. By default, "
                          "splay starts playing a sequence (Space pauses).")
+    ap.add_argument("--print-fps", action="store_true",
+                    help="while playing, print fps + frame index to stdout "
+                         "once per second. Useful for headless tests and "
+                         "for watching the first-pass→second-pass cache "
+                         "speedup.")
     args = ap.parse_args()
 
     if args.list_apps:
@@ -2069,7 +2086,8 @@ def main():
           # If a directory was passed on the command line, default to
           # auto-reload so new frames written into it appear. Toggle with 'R'.
           auto_reload=args.auto_reload or bool(source_dirs),
-          no_autoplay=args.no_autoplay).run()
+          no_autoplay=args.no_autoplay,
+          print_fps=args.print_fps).run()
 
 
 if __name__ == "__main__":
