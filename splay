@@ -53,6 +53,7 @@ Keys (in --app mode):
 import argparse, importlib.util, os, pathlib, sys, copy
 import json, socket, threading
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+import time
 import pygame
 from PIL import Image  # for libjpeg draft-decode (5x faster than pygame at 2x downscale)
 import colorsys
@@ -625,17 +626,22 @@ class Splay:
         return self.images[path]
 
     def _load_jpeg_for_fit(self, path):
-        """Pillow draft + convert to pygame Surface, sized to fit window."""
+        """Pillow draft-decode to a pygame Surface sized for the window.
+
+        draft() asks libjpeg to perform the inverse-DCT at 1/2, 1/4, or
+        1/8 native resolution directly — picking the largest that still
+        fits the target box. ~5x faster than a full decode + Pillow
+        thumbnail at 2x downscale on typical v3w frames.
+        """
         im = Image.open(str(path))
-        # draft asks libjpeg to decode at 1/2, 1/4, or 1/8 native, picking
-        # the largest that still fits the requested box. No-op for non-JPEG.
         target_w = max(640, self.window_w)
         target_h = max(480, self.window_h)
-        im.draft("RGB", (target_w * 2, target_h * 2))  # ×2 so we have some
-                                                       # headroom for zoom-blit upsample
+        # The target box must be smaller than the source for draft() to
+        # pick a non-1:1 scale. NB don't pad it ×2 — that asks for the
+        # full size and libjpeg skips the DCT downscale entirely.
+        im.draft("RGB", (target_w, target_h))
         im = im.convert("RGB")
-        mode, size, data = im.mode, im.size, im.tobytes()
-        return pygame.image.frombytes(data, size, mode).convert()
+        return pygame.image.frombuffer(im.tobytes(), im.size, "RGB").convert()
 
     def load_full(self, path):
         """Return the FULL-resolution Surface for `path`. Used when zoomed
