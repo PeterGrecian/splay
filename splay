@@ -92,6 +92,8 @@ def send_to_running_instance(abs_paths):
         except OSError: pass
         return False
 
+ADVANCE_EVENT = pygame.USEREVENT + 1
+
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp",
             ".fits", ".fit", ".fts", ".fz"}
 FITS_EXTS = {".fits", ".fit", ".fts", ".fz"}
@@ -439,6 +441,17 @@ class Splay:
         self.images = {}     # path -> pygame.Surface (lazy)
         self.fits_data = {}  # path -> raw float32 ndarray (FITS only)
         self.thumbs = {}
+
+        # Transport: Space toggles playing; the timer fires
+        # ADVANCE_EVENT at play_fps Hz, the handler calls next(play_dir).
+        # Decode time bounds the effective rate — pygame coalesces
+        # missed timer events rather than queueing them, so on the
+        # first pass through a sequence playback runs at min(target,
+        # decode_rate); second pass hits self.images cache and runs at
+        # target. Per design/splay-and-player-conventions.md.
+        self.playing = False
+        self.play_dir = +1
+        self.play_fps = 60
         self.hot_pixel_mask_paths = self._discover_masks(hot_pixel_mask_path)
         self.hot_pixel_mask_idx = 0
         self.hot_pixel_mask_path = (self.hot_pixel_mask_paths[0]
@@ -775,6 +788,34 @@ class Splay:
         if not sc: return
         self.idx = max(0, min(len(sc) - 1, self.idx + delta))
         self._show_current()
+
+    def play_advance(self):
+        """One transport tick: advance by play_dir, wrapping at the
+        ends. Called from the ADVANCE_EVENT handler while playing.
+        Wraps because the default loop mode is loop (per
+        design/splay-and-player-conventions.md)."""
+        sc = self.scope()
+        if not sc:
+            self.toggle_play()
+            return
+        n = len(sc)
+        self.idx = (self.idx + self.play_dir) % n
+        self._show_current()
+
+    def toggle_play(self):
+        """Space = play/pause. Starts the ADVANCE_EVENT timer at the
+        current play_fps; stopping cancels the timer. The effective
+        frame rate is min(play_fps, decode_rate) on first pass; on
+        repeat passes the self.images dict is warm and we hit the
+        target."""
+        self.playing = not self.playing
+        if self.playing:
+            interval_ms = max(1, int(1000 / max(1, self.play_fps)))
+            pygame.time.set_timer(ADVANCE_EVENT, interval_ms)
+            print(f"play: dir={self.play_dir:+d} target_fps={self.play_fps}")
+        else:
+            pygame.time.set_timer(ADVANCE_EVENT, 0)
+            print("pause")
 
     def remove_current(self):
         """Drop the current path from the list (does not touch disk).
@@ -1674,6 +1715,9 @@ class Splay:
                         self.drag_last = ev.pos
                 elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
                     self.dragging = False
+                elif ev.type == ADVANCE_EVENT:
+                    if self.playing:
+                        self.play_advance()
                 elif ev.type == pygame.KEYUP:
                     self._keys_held.discard(ev.key)
                 elif ev.type == pygame.KEYDOWN:
@@ -1691,6 +1735,11 @@ class Splay:
                         pygame.display.iconify()
                     elif k == pygame.K_q:
                         running = False
+                    # Transport (per design/splay-and-player-conventions.md).
+                    # Space = play/pause. Default play_dir = +1 (forward);
+                    # ,/. will set direction (not yet bound).
+                    elif k == pygame.K_SPACE:
+                        self.toggle_play()
                     elif k == pygame.K_0 and not self.app:
                         self._set_zoom("fit", pygame.mouse.get_pos())
                     elif k == pygame.K_1 and not self.app:
