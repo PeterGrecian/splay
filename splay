@@ -54,6 +54,7 @@ import argparse, importlib.util, os, pathlib, sys, copy
 import json, socket, threading
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
+from PIL import Image  # for libjpeg draft-decode (5x faster than pygame at 2x downscale)
 import colorsys
 
 
@@ -452,6 +453,10 @@ class Splay:
         self.playing = False
         self.play_dir = +1
         self.play_fps = 60
+        # Full-res JPEG cache (one entry, lazily decoded for zoom).
+        # See load_full(); the main self.images cache holds the smaller
+        # draft-decoded surfaces used in fit-mode playback.
+        self._full_res_cache = (None, None)
         # Rolling window of recent paint timestamps for fps readout.
         # _show_current() appends; HUD reads len / window_seconds.
         from collections import deque
@@ -597,6 +602,15 @@ class Splay:
 
     # ---- images ----
     def load(self, path):
+        """Return a Surface for `path`, downscaled to fit the window.
+
+        For JPEGs, uses Pillow's draft() to ask libjpeg for a half / quarter /
+        eighth-resolution decode directly, which is ~5x faster than a full
+        decode + downscale. The cached Surface is at the draft size — far
+        smaller in RAM than the original (e.g. 11 MB vs 46 MB for a v3w
+        full-frame). Zoom (`1` and `2` keys) wants pixel-accurate data — see
+        load_full() which decodes the original size on demand.
+        """
         if path not in self.images:
             try:
                 if path.suffix.lower() in FITS_EXTS:
@@ -604,11 +618,40 @@ class Splay:
                         self.fits_data[path] = _read_fits_image(path)
                     self.images[path] = self._render_fits(path).convert()
                 else:
-                    self.images[path] = pygame.image.load(str(path)).convert()
+                    self.images[path] = self._load_jpeg_for_fit(path)
             except Exception as e:
                 print(f"failed to load {path}: {e}", file=sys.stderr)
                 return None
         return self.images[path]
+
+    def _load_jpeg_for_fit(self, path):
+        """Pillow draft + convert to pygame Surface, sized to fit window."""
+        im = Image.open(str(path))
+        # draft asks libjpeg to decode at 1/2, 1/4, or 1/8 native, picking
+        # the largest that still fits the requested box. No-op for non-JPEG.
+        target_w = max(640, self.window_w)
+        target_h = max(480, self.window_h)
+        im.draft("RGB", (target_w * 2, target_h * 2))  # ×2 so we have some
+                                                       # headroom for zoom-blit upsample
+        im = im.convert("RGB")
+        mode, size, data = im.mode, im.size, im.tobytes()
+        return pygame.image.frombytes(data, size, mode).convert()
+
+    def load_full(self, path):
+        """Return the FULL-resolution Surface for `path`. Used when zoomed
+        in (1x or 2x) and we need pixel-accurate data. Held in a one-entry
+        cache (self._full_res_cache) so flipping between zoom modes on the
+        same frame doesn't re-decode every time."""
+        cached = getattr(self, "_full_res_cache", (None, None))
+        if cached[0] == path and cached[1] is not None:
+            return cached[1]
+        try:
+            surf = pygame.image.load(str(path)).convert()
+        except Exception as e:
+            print(f"failed to full-load {path}: {e}", file=sys.stderr)
+            return None
+        self._full_res_cache = (path, surf)
+        return surf
 
     def _render_fits(self, path):
         import numpy as np
@@ -1215,7 +1258,14 @@ class Splay:
     # ---- which surface to show? ----
     def _surface_for_view(self):
         if not self.curr_path: return None
-        in_surf = self.load(self.curr_path)
+        # Zoomed in → caller wants pixel-accurate data; fall back to a
+        # full-res decode for the current frame only. Fit mode uses the
+        # downscaled cache (much smaller, much faster playback).
+        if (self.zoom_mode != "fit"
+                and self.curr_path.suffix.lower() not in FITS_EXTS):
+            in_surf = self.load_full(self.curr_path)
+        else:
+            in_surf = self.load(self.curr_path)
         if in_surf is None: return None
         if not self.app:
             return in_surf
@@ -1706,6 +1756,13 @@ class Splay:
                     self.window_w, self.window_h = ev.w, ev.h
                     if not self.fullscreen:
                         self.screen = pygame.display.get_surface()
+                    # JPEG cache is sized to fit the old window — drop it so
+                    # the next decode lands at the new resolution. FITS
+                    # renders aren't window-sized; preserve those.
+                    for p in [pp for pp in self.images
+                              if pp.suffix.lower() not in FITS_EXTS]:
+                        self.images.pop(p, None)
+                    self._full_res_cache = (None, None)
                 elif ev.type == pygame.MOUSEMOTION and self.wipe_on:
                     self.wipe_x = ev.pos[0]
                 elif ev.type == pygame.MOUSEMOTION and self.app and self.view == VIEW_WIPE:
