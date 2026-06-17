@@ -875,6 +875,23 @@ class Splay:
                       f"dir={self.play_dir:+d}", flush=True)
                 self._last_fps_print = now
 
+    def nudge_pace(self, delta):
+        """Step through the discrete pace set (¼ ½ 1 2 4 ×). Updates
+        play_fps and re-arms the timer if currently playing so the new
+        rate takes effect immediately."""
+        BASE = 60
+        STEPS = [BASE // 4, BASE // 2, BASE, BASE * 2, BASE * 4]
+        # Find the nearest current step
+        cur = min(range(len(STEPS)), key=lambda i: abs(STEPS[i] - self.play_fps))
+        new = max(0, min(len(STEPS) - 1, cur + delta))
+        if new == cur:
+            return
+        self.play_fps = STEPS[new]
+        print(f"pace: target_fps={self.play_fps}")
+        if self.playing:
+            interval_ms = max(1, int(1000 / max(1, self.play_fps)))
+            pygame.time.set_timer(ADVANCE_EVENT, interval_ms)
+
     def toggle_play(self):
         """Space = play/pause. Starts the ADVANCE_EVENT timer at the
         current play_fps; stopping cancels the timer. The effective
@@ -1546,13 +1563,22 @@ class Splay:
             if len(self.hot_pixel_mask_paths) > 1:
                 pos = f"  ({self.hot_pixel_mask_idx+1}/{len(self.hot_pixel_mask_paths)})"
             mask_line += f"{state}  [{n_str}]{hl}  {nm}{pos}"
+        play_line = (
+            f"PLAY  dir:{self.play_dir:+d}  target:{self.play_fps} fps"
+            if self.playing
+            else f"paused  (last dir:{self.play_dir:+d}  target:{self.play_fps} fps)"
+        )
         lines = [
             "splay" + (f" — app: {self.app.NAME}" if self.app else "") + "      h = HUD",
             frame,
             f"zoom: {self.zoom_mode}    auto-reload: {'ON' if self.auto_reload else 'off'}",
+            play_line,
             mask_line,
             "",
             "(most keys are toggles)",
+            "Space play / pause",
+            ",     play backward   .     play forward",
+            "< >   pace slower / faster   (¼× ½× 1× 2× 4×)",
             "← →   prev / next   (Shift+← →  jump ±20)",
             "s     select   d  deselect",
             "l     list / selected mode",
@@ -1845,18 +1871,23 @@ class Splay:
                     #   .     = play forward  (starts playing if paused)
                     elif k == pygame.K_SPACE:
                         self.toggle_play()
-                    elif k == pygame.K_COMMA:
+                    elif k == pygame.K_COMMA and not (mods & pygame.KMOD_SHIFT):
                         self.play_dir = -1
                         if not self.playing:
                             self.toggle_play()
                         else:
                             print(f"play: dir=-1")
-                    elif k == pygame.K_PERIOD:
+                    elif k == pygame.K_PERIOD and not (mods & pygame.KMOD_SHIFT):
                         self.play_dir = +1
                         if not self.playing:
                             self.toggle_play()
                         else:
                             print(f"play: dir=+1")
+                    # < and > (shift-, / shift-.) — pace.
+                    elif (k == pygame.K_COMMA and mods & pygame.KMOD_SHIFT):
+                        self.nudge_pace(-1)
+                    elif (k == pygame.K_PERIOD and mods & pygame.KMOD_SHIFT):
+                        self.nudge_pace(+1)
                     elif k == pygame.K_0 and not self.app:
                         self._set_zoom("fit", pygame.mouse.get_pos())
                     elif k == pygame.K_1 and not self.app:
