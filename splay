@@ -1758,10 +1758,23 @@ class Splay:
                     elif k == pygame.K_q:
                         running = False
                     # Transport (per design/splay-and-player-conventions.md).
-                    # Space = play/pause. Default play_dir = +1 (forward);
-                    # ,/. will set direction (not yet bound).
+                    #   Space = play/pause (keeps current direction)
+                    #   ,     = play backward (starts playing if paused)
+                    #   .     = play forward  (starts playing if paused)
                     elif k == pygame.K_SPACE:
                         self.toggle_play()
+                    elif k == pygame.K_COMMA:
+                        self.play_dir = -1
+                        if not self.playing:
+                            self.toggle_play()
+                        else:
+                            print(f"play: dir=-1")
+                    elif k == pygame.K_PERIOD:
+                        self.play_dir = +1
+                        if not self.playing:
+                            self.toggle_play()
+                        else:
+                            print(f"play: dir=+1")
                     elif k == pygame.K_0 and not self.app:
                         self._set_zoom("fit", pygame.mouse.get_pos())
                     elif k == pygame.K_1 and not self.app:
