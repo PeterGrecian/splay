@@ -885,10 +885,10 @@ class Splay:
         if self.playing:
             interval_ms = max(1, int(1000 / max(1, self.play_fps)))
             pygame.time.set_timer(ADVANCE_EVENT, interval_ms)
-            print(f"play: dir={self.play_dir:+d} target_fps={self.play_fps}")
+            print(f"play: dir={self.play_dir:+d} target_fps={self.play_fps}", flush=True)
         else:
             pygame.time.set_timer(ADVANCE_EVENT, 0)
-            print("pause")
+            print("pause", flush=True)
 
     def remove_current(self):
         """Drop the current path from the list (does not touch disk).
