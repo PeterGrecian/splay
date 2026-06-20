@@ -1867,22 +1867,30 @@ class Splay:
                         running = False
                     # Transport (per design/splay-and-player-conventions.md).
                     #   Space = play/pause (keeps current direction)
-                    #   ,     = play backward (starts playing if paused)
-                    #   .     = play forward  (starts playing if paused)
+                    #   ,     = play backward (starts playing if paused;
+                    #           stops if already playing backward)
+                    #   .     = play forward  (starts playing if paused;
+                    #           stops if already playing forward)
                     elif k == pygame.K_SPACE:
                         self.toggle_play()
                     elif k == pygame.K_COMMA and not (mods & pygame.KMOD_SHIFT):
-                        self.play_dir = -1
-                        if not self.playing:
+                        if self.playing and self.play_dir == -1:
                             self.toggle_play()
                         else:
-                            print(f"play: dir=-1")
+                            self.play_dir = -1
+                            if not self.playing:
+                                self.toggle_play()
+                            else:
+                                print(f"play: dir=-1")
                     elif k == pygame.K_PERIOD and not (mods & pygame.KMOD_SHIFT):
-                        self.play_dir = +1
-                        if not self.playing:
+                        if self.playing and self.play_dir == +1:
                             self.toggle_play()
                         else:
-                            print(f"play: dir=+1")
+                            self.play_dir = +1
+                            if not self.playing:
+                                self.toggle_play()
+                            else:
+                                print(f"play: dir=+1")
                     # < and > (shift-, / shift-.) — pace.
                     elif (k == pygame.K_COMMA and mods & pygame.KMOD_SHIFT):
                         self.nudge_pace(-1)
