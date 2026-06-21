@@ -76,9 +76,9 @@ def _splay_socket_path():
 SPLAY_SOCKET_PATH = _splay_socket_path()
 
 
-def send_to_running_instance(abs_paths):
-    """Try to deliver a list of absolute paths to a running splay.
-    Returns True if delivered, False if no instance is listening."""
+def _send_ipc(msg):
+    """Send one JSON command dict to a running splay. Returns True if
+    delivered, False if no instance is listening."""
     if not os.path.exists(SPLAY_SOCKET_PATH):
         print(f"splay: no running instance (socket {SPLAY_SOCKET_PATH} absent)",
               file=sys.stderr)
@@ -87,16 +87,20 @@ def send_to_running_instance(abs_paths):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.5)
         s.connect(SPLAY_SOCKET_PATH)
-        msg = json.dumps({"cmd": "open", "paths": abs_paths}) + "\n"
-        s.sendall(msg.encode())
+        s.sendall((json.dumps(msg) + "\n").encode())
         s.close()
         return True
     except (OSError, socket.timeout) as e:
-        print(f"splay: IPC handoff failed ({e}); unlinking stale socket "
+        print(f"splay: IPC send failed ({e}); unlinking stale socket "
               f"{SPLAY_SOCKET_PATH}", file=sys.stderr)
         try: os.unlink(SPLAY_SOCKET_PATH)  # stale
         except OSError: pass
         return False
+
+
+def send_to_running_instance(abs_paths):
+    """Try to deliver a list of absolute paths to a running splay."""
+    return _send_ipc({"cmd": "open", "paths": abs_paths})
 
 ADVANCE_EVENT = pygame.USEREVENT + 1
 
@@ -505,6 +509,7 @@ class Splay:
         # Single-instance IPC.
         self._ipc_lock = threading.Lock()
         self._ipc_pending = []  # list of path strings from remote invocations
+        self._ipc_commands = []  # list of command dicts (clear / key) from IPC
         self._ipc_sock = None
         self._start_ipc_server()
         self.selected = set()
@@ -1099,13 +1104,51 @@ class Splay:
                     data += chunk
                 line = data.split(b"\n", 1)[0]
                 msg = json.loads(line.decode())
-                if msg.get("cmd") == "open":
+                cmd = msg.get("cmd")
+                if cmd == "open":
                     with self._ipc_lock:
                         self._ipc_pending.extend(msg.get("paths", []))
+                elif cmd == "clear":
+                    with self._ipc_lock:
+                        self._ipc_commands.append({"cmd": "clear"})
+                elif cmd == "key":
+                    # Inject a synthetic keypress so the existing hotkey
+                    # handlers run — lets a script drive any splay key
+                    # (e.g. `splay --send key:r` to reload). The key names
+                    # are pygame K_ names without the prefix: r, HOME, etc.
+                    with self._ipc_lock:
+                        self._ipc_commands.append(
+                            {"cmd": "key", "key": msg.get("key", "")})
             except (OSError, ValueError):
                 pass
             finally:
                 conn.close()
+
+    def _drain_ipc_commands(self):
+        """Process IPC clear/key commands on the main thread."""
+        with self._ipc_lock:
+            if not self._ipc_commands: return
+            cmds = self._ipc_commands
+            self._ipc_commands = []
+        for c in cmds:
+            if c.get("cmd") == "clear":
+                self.clear_all()
+            elif c.get("cmd") == "key":
+                name = str(c.get("key", "")).strip()
+                code = getattr(pygame, f"K_{name}", None)
+                if code is None and len(name) == 1:
+                    code = getattr(pygame, f"K_{name.lower()}", None)
+                if code is not None:
+                    pygame.event.post(pygame.event.Event(
+                        pygame.KEYDOWN, key=code, mod=0, unicode=""))
+
+    def clear_all(self):
+        """Empty the loaded frame list (keep the window open)."""
+        self.paths = []
+        self.idx = 0
+        self.selected = set()
+        self._invalidate_labels()
+        print("cleared all frames", file=sys.stderr, flush=True)
 
     def _drain_ipc(self):
         with self._ipc_lock:
@@ -1803,6 +1846,7 @@ class Splay:
             idx_before = self.idx
             self._advanced_this_batch = False  # transport: see ADVANCE_EVENT
             self._drain_ipc()
+            self._drain_ipc_commands()  # clear / injected-key commands
             need_redraw = (len(self.paths) != paths_before or
                            self.idx != idx_before)
             if self.auto_reload and time.monotonic() - self.last_auto_scan >= 1.0:
@@ -1959,6 +2003,8 @@ class Splay:
                         self.next(-len(self.scope()))   # jump to first frame
                     elif k == pygame.K_END:
                         self.next(len(self.scope()))    # jump to last frame
+                    elif k == pygame.K_c and (mods & pygame.KMOD_SHIFT):
+                        self.clear_all()   # Shift+C: clear all frames
                     elif k == pygame.K_s:
                         self.select()
                     elif k == pygame.K_d:
@@ -2104,7 +2150,23 @@ def main():
                          "once per second. Useful for headless tests and "
                          "for watching the first-pass→second-pass cache "
                          "speedup.")
+    ap.add_argument("--send", default=None, metavar="CMD",
+                    help="send a command to the running splay over IPC and "
+                         "exit. CMD is 'clear', or 'key:NAME' to inject a "
+                         "keypress (NAME = pygame key without K_, e.g. "
+                         "key:r reload, key:HOME first frame, key:c). "
+                         "Lets scripts drive splay's hotkeys.")
     args = ap.parse_args()
+
+    if args.send:
+        if args.send == "clear":
+            ok = _send_ipc({"cmd": "clear"})
+        elif args.send.startswith("key:"):
+            ok = _send_ipc({"cmd": "key", "key": args.send[4:]})
+        else:
+            print(f"splay --send: unknown command {args.send!r}",
+                  file=sys.stderr); return
+        sys.exit(0 if ok else 1)
 
     if args.list_apps:
         print("apps:")
