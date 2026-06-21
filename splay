@@ -25,7 +25,11 @@ Keys (always):
     1           pixel-for-pixel (100%)
     2           zoomed in (200%)
     3 / 4       FITS auto-stretch: darker / brighter (re-renders from raw)
-    p           pixel data at mouse position (BGR + HSV)
+    p           print pixel at mouse position to stdout: full path +
+                (x,y) + RGB/HSV, plus a "PROBE <path> <x> <y>" line for
+                parsing. Non-modal — each press prints the current pixel.
+                ALSO always appended to ~/.splay-probes.log (override with
+                $SPLAY_PROBE_LOG) so positions are readable without piping.
     m           toggle hot-pixel mask (FITS only)
     M           toggle red highlight of hot pixels (FITS only)
     z / x       step backward / forward through sibling masks
@@ -95,6 +99,13 @@ def send_to_running_instance(abs_paths):
         return False
 
 ADVANCE_EVENT = pygame.USEREVENT + 1
+
+# Fixed log that the pixel probe (p key) ALWAYS appends to, so probe
+# positions are readable regardless of how splay was launched (no need
+# to pipe/tee stdout). Override with $SPLAY_PROBE_LOG.
+PROBE_LOG = pathlib.Path(
+    os.environ.get("SPLAY_PROBE_LOG",
+                   str(pathlib.Path.home() / ".splay-probes.log")))
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp",
             ".fits", ".fit", ".fts", ".fz"}
@@ -1589,7 +1600,7 @@ class Splay:
             "r / R reload now / auto-reload",
             "0 1 2 fit / 1:1 / 2× zoom",
             f"3 / 4 dark/bright  p{self.stretch_lo_pct:.1f}→{self.stretch_hi_pct:.2f}",
-            "p     pixel data at mouse position",
+            "p     print pixel at mouse → stdout + ~/.splay-probes.log",
             "m / M hot-pixel mask / red-highlight (FITS)",
             "z x   step through pre-generated masks",
             "g     open in GIMP   Del  remove from list",
@@ -1680,9 +1691,27 @@ class Splay:
             hot_tag = ""
             if is_hot is True: hot_tag = "  HOT"
             elif is_hot is False: hot_tag = "  (not hot)"
-            print(f"  {frame_label}  {mask_label}{hot_tag}")
+            # Print the FULL path (not the short name) so the output is
+            # unambiguous when scrubbing across hours/dirs, and flush so
+            # it reaches a pipe immediately (e.g. `splay ... | tee log`).
+            print(f"  {cur} [{self.idx+1}/{len(self.scope())}]  "
+                  f"{mask_label}{hot_tag}", flush=True)
             print(f"  ({ix},{iy})  RGB=({r},{g},{b})  "
-                  f"HSV=({int(hh*180)},{int(ss*255)},{int(vv*255)})")
+                  f"HSV=({int(hh*180)},{int(ss*255)},{int(vv*255)})",
+                  flush=True)
+            # Machine-readable line for piping/parsing: PROBE <path> <x> <y>
+            probe_line = f"PROBE {cur} {ix} {iy}"
+            print(probe_line, flush=True)
+            # Also ALWAYS append to a fixed log, so probe positions are
+            # readable regardless of how splay was launched (no need to
+            # pipe/tee). Best-effort; never let logging break the probe.
+            try:
+                from datetime import datetime as _dt
+                with open(PROBE_LOG, "a") as _pf:
+                    _pf.write(f"{_dt.now().isoformat(timespec='seconds')} "
+                              f"{probe_line}  RGB=({r},{g},{b})\n")
+            except OSError:
+                pass
 
         # In app mode, give the app a chance to update params.
         if self.app and hasattr(self.app, "on_click"):
@@ -1907,17 +1936,12 @@ class Splay:
                     elif k == pygame.K_4 and not self.app:
                         self.adjust_stretch(+1)   # brighter
                     elif k == pygame.K_p:
-                        if self.pixel_probe_mode == "off":
-                            self.pixel_probe_mode = "snapshot"
-                            self.on_click(pygame.mouse.get_pos())
-                        elif self.pixel_probe_mode == "snapshot":
-                            self.pixel_probe_mode = "live"
-                            self.on_click(pygame.mouse.get_pos(), quiet=True)
-                            print("pixel probe: live")
-                        else:
-                            self.pixel_probe_mode = "off"
-                            self.click_info = None
-                            print("pixel probe: off")
+                        # p prints the pixel at the current mouse position
+                        # (full path + x,y + RGB/HSV + a PROBE parse line)
+                        # and shows it on-screen. Press again at a new
+                        # mouse position to print that one. No silent mode.
+                        self.pixel_probe_mode = "snapshot"
+                        self.on_click(pygame.mouse.get_pos())
                     elif k == pygame.K_m:
                         if mods & pygame.KMOD_SHIFT:
                             self.toggle_hot_pixel_highlight()
