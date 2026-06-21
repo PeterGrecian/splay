@@ -1590,7 +1590,7 @@ class Splay:
             "Space play / pause",
             ",     play backward   .     play forward",
             "< >   pace slower / faster   (¼× ½× 1× 2× 4×)",
-            "← →   prev / next   (Shift+← →  jump ±20)",
+            "← →   prev / next   (Shift+← →  ±20;  Home/End first/last)",
             "s     select   d  deselect",
             "l     list / selected mode",
             f"a     sort: name / age / added  (now: {self.SORT_LABELS[self.sort_mode]})",
@@ -1955,6 +1955,10 @@ class Splay:
                         self.next(+20 if mods & pygame.KMOD_SHIFT else +1)
                     elif k == pygame.K_LEFT:
                         self.next(-20 if mods & pygame.KMOD_SHIFT else -1)
+                    elif k == pygame.K_HOME:
+                        self.next(-len(self.scope()))   # jump to first frame
+                    elif k == pygame.K_END:
+                        self.next(len(self.scope()))    # jump to last frame
                     elif k == pygame.K_s:
                         self.select()
                     elif k == pygame.K_d:
