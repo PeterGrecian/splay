@@ -1704,13 +1704,23 @@ class Splay:
     def on_click(self, screen_pos, quiet=False):
         cur = self.curr_path
         if not cur: return
-        surf = self.load(cur)
+        # Use the SAME surface the display uses (full-res when zoomed,
+        # draft when fit) so the hit-test rect matches what's on screen.
+        # Using self.load() here computed the rect off the fit/draft
+        # surface even when zoomed -> the collision test was wrong and a
+        # p-probe over the (zoomed) image silently missed.
+        surf = self._surface_for_view() or self.load(cur)
         if surf is None: return
         target = self.image_blit_rect(surf)
         sx, sy = screen_pos
         if not target.collidepoint(sx, sy):
             if quiet:
                 self.click_info = None
+            elif not quiet:
+                # Don't fail silently: a p-probe with the mouse off the
+                # image (letterbox margin / strip) was dropping points.
+                print("probe: mouse not over image (move onto it, press p)",
+                      file=sys.stderr, flush=True)
             return
         u = (sx - target.x) / target.w
         v = (sy - target.y) / target.h
