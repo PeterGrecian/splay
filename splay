@@ -1311,29 +1311,35 @@ class Splay:
 
     def _set_zoom(self, mode, anchor):
         """Switch zoom mode while keeping the image pixel under `anchor`
-        (screen-space x, y) pinned in place. For 'fit', pan is always 0."""
-        surf = self.load(self.curr_path) if self.curr_path else None
-        if surf is None or mode == self.zoom_mode:
+        (screen-space x, y) pinned in place. For 'fit', pan is always 0.
+
+        Works in FRACTIONAL image coords (0..1), not pixels. The fit-mode
+        surface is the downscaled cache; the zoomed view uses the full-res
+        decode (see _surface_for_view) — different pixel dimensions. The old
+        code read the anchor pixel off the fit surface but sized the zoom
+        rect in full-res pixels, so the anchor landed in the wrong place
+        (the zoom-to-mouse bug). A fraction is resolution-independent and
+        carries cleanly between the two surfaces."""
+        cur_surf = self._surface_for_view()
+        if cur_surf is None:
             self.zoom_mode = mode
-            if mode == "fit":
-                self.pan_x = self.pan_y = 0
+            self.pan_x = self.pan_y = 0
             return
-        old = self.image_blit_rect(surf)
-        iw, ih = surf.get_width(), surf.get_height()
+        old = self.image_blit_rect(cur_surf)
         mx, my = anchor
         if not old.collidepoint(mx, my):
             mx, my = old.centerx, old.centery
-        img_px = (mx - old.x) * iw / old.w
-        img_py = (my - old.y) * ih / old.h
+        fx = min(1.0, max(0.0, (mx - old.x) / old.w))
+        fy = min(1.0, max(0.0, (my - old.y) / old.h))
         self.zoom_mode = mode
         if mode == "fit":
             self.pan_x = self.pan_y = 0
             return
+        # Place the zoomed image so fraction (fx,fy) lands under (mx,my).
         self.pan_x = self.pan_y = 0
-        base = self.image_blit_rect(surf)  # centred, pan=0
-        new_w, new_h = base.w, base.h
-        self.pan_x = int(round(mx - base.x - img_px * new_w / iw))
-        self.pan_y = int(round(my - base.y - img_py * new_h / ih))
+        base = self.image_blit_rect(self._surface_for_view())  # new mode, centred
+        self.pan_x = int(round(mx - base.x - fx * base.w))
+        self.pan_y = int(round(my - base.y - fy * base.h))
 
     def image_blit_rect(self, surf):
         area = self.display_area()
