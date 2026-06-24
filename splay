@@ -1663,7 +1663,17 @@ class Splay:
     def _set_zoom(self, mode, anchor):
         """Switch zoom mode while keeping the image pixel under `anchor`
         (screen-space x, y) pinned in place. For 'fit', pan is always 0."""
-        surf = self.load(self.curr_path) if self.curr_path else None
+        # Anchor against the SAME surface draw() will display in the target
+        # mode. For JPEGs that's the full-res decode when zoomed (load_full),
+        # vs the draft/downscaled load() in fit mode — using the wrong one made
+        # 2x anchor on the wrong part of the image. Compute with the target
+        # mode's surface, not the current one's.
+        if self.curr_path is None:
+            surf = None
+        elif mode != "fit" and self.curr_path.suffix.lower() not in FITS_EXTS:
+            surf = self.load_full(self.curr_path)
+        else:
+            surf = self.load(self.curr_path)
         if surf is None or mode == self.zoom_mode:
             self.zoom_mode = mode
             if mode == "fit":
