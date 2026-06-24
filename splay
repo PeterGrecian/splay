@@ -76,6 +76,30 @@ def _splay_socket_path():
 SPLAY_SOCKET_PATH = _splay_socket_path()
 
 
+# ---- state protocol files ----------------------------------------------------
+# splay exposes (and, for `state`, accepts) its live state via three JSON files
+# in $HOME. Debuggable with `cat`/`jq`; readable by anything (me, a web control
+# page, another process). See design/splay-state-protocol.md for the full spec.
+#   state  — settings: bidirectional, write-on-change + read-every-frame
+#            (mtime-gated). Write it to DRIVE the visualisation.
+#   loaded — the loaded path list: write-on-load. "what's loaded".
+#   frame  — the cursor (idx/playing/...): write-often, coalesced.
+# Override the directory with $SPLAY_STATE_DIR (e.g. point it at a shared dir
+# for a multi-device control-plane / view-plane split).
+def _splay_state_dir():
+    d = os.environ.get("SPLAY_STATE_DIR")
+    return pathlib.Path(d) if d else pathlib.Path.home()
+
+SPLAY_STATE_DIR = _splay_state_dir()
+SPLAY_STATE_PATH = SPLAY_STATE_DIR / ".splay-state.json"
+SPLAY_LOADED_PATH = SPLAY_STATE_DIR / ".splay-loaded.json"
+SPLAY_FRAME_PATH = SPLAY_STATE_DIR / ".splay-frame.json"
+
+# Coalesce the high-churn frame-cursor file to at most this rate, so a remote
+# state backend (shared dir / HTTP) isn't hammered on every autoplay tick.
+FRAME_WRITE_HZ = 10
+
+
 def _send_ipc(msg):
     """Send one JSON command dict to a running splay. Returns True if
     delivered, False if no instance is listening."""
@@ -122,6 +146,52 @@ VIEW_OUTPUT = 2
 VIEW_MASK = 3
 VIEW_NAMES = {VIEW_INPUT: "input", VIEW_WIPE: "wipe",
               VIEW_OUTPUT: "output", VIEW_MASK: "mask"}
+
+
+class StateStore:
+    """Backing store for splay's three state files (state/loaded/frame).
+
+    This is the seam that keeps splay's frame loop transport-agnostic: it is
+    backed by local JSON files here, but the same read/write interface can be
+    re-backed by a shared directory (NFS/syncthing → multi-device) or an HTTP
+    endpoint (→ over-internet web control plane) without touching splay.
+
+    Writes are atomic (temp + os.replace) so a reader never sees a half-written
+    file. Reads of `state` are mtime-gated by the caller — read_state() returns
+    (data, mtime) and the caller skips the JSON parse when mtime is unchanged.
+    """
+    def __init__(self, state_path, loaded_path, frame_path):
+        self.state_path = pathlib.Path(state_path)
+        self.loaded_path = pathlib.Path(loaded_path)
+        self.frame_path = pathlib.Path(frame_path)
+
+    def _write_atomic(self, path, obj):
+        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+        try:
+            with open(tmp, "w") as f:
+                json.dump(obj, f, indent=1, sort_keys=True)
+            os.replace(tmp, path)
+        except OSError as e:
+            print(f"state: write {path.name} failed: {e}", file=sys.stderr)
+            try: os.unlink(tmp)
+            except OSError: pass
+
+    def write_state(self, obj):  self._write_atomic(self.state_path, obj)
+    def write_loaded(self, obj): self._write_atomic(self.loaded_path, obj)
+    def write_frame(self, obj):  self._write_atomic(self.frame_path, obj)
+
+    def state_mtime(self):
+        try: return self.state_path.stat().st_mtime
+        except OSError: return None
+
+    def read_state(self):
+        """Return (data_dict, mtime) or (None, None) if absent/unreadable."""
+        try:
+            mtime = self.state_path.stat().st_mtime
+            with open(self.state_path) as f:
+                return json.load(f), mtime
+        except (OSError, ValueError):
+            return None, None
 
 
 def gather_paths(args):
@@ -512,6 +582,20 @@ class Splay:
         self._ipc_commands = []  # list of command dicts (clear / key) from IPC
         self._ipc_sock = None
         self._start_ipc_server()
+
+        # State protocol (see design/splay-state-protocol.md). Three JSON files
+        # expose / accept our live state. _sync_state_out writes on change,
+        # _apply_state_in reads `state` (mtime-gated) so an external writer can
+        # drive the view. `version` orders writes across writers/devices.
+        self._store = StateStore(SPLAY_STATE_PATH, SPLAY_LOADED_PATH,
+                                 SPLAY_FRAME_PATH)
+        self._state_version = 0
+        self._last_state_written = None
+        self._last_loaded_written = None
+        self._state_seen_mtime = None
+        self._last_frame_written = None
+        self._last_frame_write_t = 0.0
+        self._frame_write_due = False
         self.selected = set()
         self.list_mode = list_mode
         self.idx = 0
@@ -570,6 +654,10 @@ class Splay:
         # change direction; q quits. Disable with --no-autoplay.
         if not getattr(self, "_no_autoplay", False) and len(self.paths) > 1:
             self.toggle_play()
+
+        # Publish initial state so a controller/reader sees us immediately.
+        self._sync_state_out(force=True)
+        self._write_frame(force=True)
 
     # ---- sort ----
     SORT_MODES = ("name", "mtime", "added")
@@ -833,6 +921,162 @@ class Splay:
 
     def _invalidate_processed(self):
         self.processed_cache.clear()
+
+    # ---- state protocol (see design/splay-state-protocol.md) ----
+    # Settings that go in `state`. write-on-change + read-every-frame
+    # (mtime-gated). External writers (web page, another process) may write
+    # this file to DRIVE the visualisation; we reconcile via a monotonic
+    # `version` + a `writer` id so a stale write can't clobber a newer change.
+    def _state_dict(self):
+        """The settings half of splay's state, minus version/writer (those are
+        added at write time). Compared as a dict to detect change."""
+        d = {
+            "sort_mode": self.sort_mode,
+            "list_mode": self.list_mode,
+            "show_strip": self.show_strip,
+            "show_hud": self.show_hud,
+            "show_regions": self.show_regions,
+            "fullscreen": self.fullscreen,
+            "zoom_mode": self.zoom_mode,
+            "hot_pixel_mask_on": self.hot_pixel_mask_on,
+            "hot_pixel_highlight": self.hot_pixel_highlight,
+            "hot_pixel_mask_idx": self.hot_pixel_mask_idx,
+            "stretch_lo_pct": round(self.stretch_lo_pct, 4),
+            "stretch_hi_pct": round(self.stretch_hi_pct, 4),
+            "auto_reload": self.auto_reload,
+            "selected": sorted(str(p) for p in self.selected),
+        }
+        if self.app:
+            d["app"] = self.app.NAME
+            d["view"] = VIEW_NAMES.get(self.view, "input")
+            d["params"] = dict(self.params)
+        return d
+
+    def _loaded_dict(self):
+        return {
+            "count": len(self.paths),
+            "paths": [str(p) for p in self.paths],
+            "source_dirs": [str(p) for p in self.source_dirs],
+            "version": self._state_version,
+            "writer": "renderer",
+        }
+
+    def _frame_dict(self):
+        return {
+            "idx": self.idx,
+            "current": str(self.curr_path) if self.curr_path else None,
+            "count": len(self.scope()),
+            "playing": self.playing,
+            "play_dir": self.play_dir,
+            "play_fps": self.play_fps,
+            "version": self._state_version,
+            "writer": "renderer",
+        }
+
+    def _sync_state_out(self, force=False):
+        """Write `state` and/or `loaded` if our settings or path list changed
+        since the last write. Cheap dict-compare gates the write so this can be
+        called once per event batch. Bumps `version` on every change so
+        external writers can detect/order against us."""
+        sd = self._state_dict()
+        if force or sd != self._last_state_written:
+            self._state_version += 1
+            out = dict(sd)
+            out["version"] = self._state_version
+            out["writer"] = "renderer"
+            self._store.write_state(out)
+            self._last_state_written = sd
+            # Our own write moves the mtime; record it so the next read-back
+            # doesn't mistake our write for an external one.
+            self._state_seen_mtime = self._store.state_mtime()
+        loaded_key = (tuple(str(p) for p in self.paths),
+                      tuple(str(p) for p in self.source_dirs))
+        if force or loaded_key != self._last_loaded_written:
+            self._store.write_loaded(self._loaded_dict())
+            self._last_loaded_written = loaded_key
+
+    def _write_frame(self, force=False):
+        """Write the high-churn cursor file, coalesced to FRAME_WRITE_HZ so a
+        remote backend isn't hammered every autoplay tick."""
+        now = time.monotonic()
+        key = (self.idx, str(self.curr_path), self.playing, self.play_dir,
+               self.play_fps)
+        if not force and key == self._last_frame_written:
+            return
+        if not force and (now - self._last_frame_write_t) < (1.0 / FRAME_WRITE_HZ):
+            self._frame_write_due = True   # let the run loop flush it soon
+            return
+        self._store.write_frame(self._frame_dict())
+        self._last_frame_written = key
+        self._last_frame_write_t = now
+        self._frame_write_due = False
+
+    def _apply_state_in(self):
+        """Read `state` (mtime-gated); if an EXTERNAL writer changed it, apply
+        the settings to the live view. Our own writes are ignored via mtime +
+        version. Called once per frame from the run loop."""
+        mtime = self._store.state_mtime()
+        if mtime is None or mtime == self._state_seen_mtime:
+            return  # unchanged since we last saw it → no parse, near-zero cost
+        data, mtime = self._store.read_state()
+        self._state_seen_mtime = mtime
+        if not data:
+            return
+        # Ignore our own writes (mtime already advanced past them in most
+        # cases; this is the belt-and-braces check).
+        if data.get("writer") == "renderer":
+            return
+        # Reject stale / out-of-order controller writes by version. A controller
+        # MUST write version > the current one (read it first). On reject we
+        # immediately re-publish our authoritative state so the stale file
+        # cannot linger and contaminate a later accepted write with its other
+        # field values.
+        ver = data.get("version")
+        if isinstance(ver, int) and ver <= self._state_version:
+            self._sync_state_out(force=True)
+            return
+        if isinstance(ver, int):
+            self._state_version = ver
+        self._apply_external_settings(data)
+
+    def _apply_external_settings(self, d):
+        """Apply a controller-supplied settings dict to the live view. Only
+        keys present are applied; unknown keys ignored. Re-renders as needed."""
+        changed_render = False
+        if "sort_mode" in d and d["sort_mode"] in self.SORT_MODES \
+                and d["sort_mode"] != self.sort_mode:
+            self.sort_mode = d["sort_mode"]
+            self.paths = self._sort_paths(self.paths)
+        if "list_mode" in d:    self.list_mode = bool(d["list_mode"])
+        if "show_strip" in d:   self.show_strip = bool(d["show_strip"])
+        if "show_hud" in d:     self.show_hud = bool(d["show_hud"])
+        if "show_regions" in d: self.show_regions = bool(d["show_regions"])
+        if "auto_reload" in d:  self.auto_reload = bool(d["auto_reload"])
+        if "zoom_mode" in d and d["zoom_mode"] in ("fit", "1x", "2x"):
+            self.zoom_mode = d["zoom_mode"]
+        if "hot_pixel_mask_on" in d and bool(d["hot_pixel_mask_on"]) != self.hot_pixel_mask_on:
+            self.hot_pixel_mask_on = bool(d["hot_pixel_mask_on"]) and bool(self.hot_pixel_mask_path)
+            changed_render = True
+        if "hot_pixel_highlight" in d and bool(d["hot_pixel_highlight"]) != self.hot_pixel_highlight:
+            self.hot_pixel_highlight = bool(d["hot_pixel_highlight"]) and bool(self.hot_pixel_mask_path)
+            changed_render = True
+        for pct in ("stretch_lo_pct", "stretch_hi_pct"):
+            if pct in d:
+                try:
+                    v = float(d[pct])
+                    if abs(v - getattr(self, pct)) > 1e-6:
+                        setattr(self, pct, v); changed_render = True
+                except (TypeError, ValueError): pass
+        if "selected" in d and isinstance(d["selected"], list):
+            self.selected = {pathlib.Path(s) for s in d["selected"]}
+        if "idx" in d:
+            try: self.next(int(d["idx"]) - self.idx)
+            except (TypeError, ValueError): pass
+        if changed_render:
+            self._invalidate_all_fits_renders()
+        # Reflect what we actually applied straight back out (write-on-change),
+        # so the file converges to our reconciled live state.
+        self._sync_state_out()
 
     # ---- nav ----
     def _show_current(self):
@@ -1847,6 +2091,9 @@ class Splay:
             self._advanced_this_batch = False  # transport: see ADVANCE_EVENT
             self._drain_ipc()
             self._drain_ipc_commands()  # clear / injected-key commands
+            # State protocol: pick up any EXTERNAL write to `state` (mtime-gated,
+            # so it's near-free when unchanged) and apply it to the live view.
+            self._apply_state_in()
             need_redraw = (len(self.paths) != paths_before or
                            self.idx != idx_before)
             if self.auto_reload and time.monotonic() - self.last_auto_scan >= 1.0:
@@ -2072,6 +2319,16 @@ class Splay:
                             except Exception as e:
                                 msg = f"on_save failed: {e}"
                             print(msg or "saved")
+            # State protocol: publish our state. _sync_state_out is a cheap
+            # dict-compare (only writes `state`/`loaded` on real change);
+            # _write_frame is coalesced to FRAME_WRITE_HZ. _frame_write_due is
+            # set when a cursor change was throttled — flush it once the window
+            # has passed so the cursor file doesn't stall on the last move.
+            self._sync_state_out()
+            if self._frame_write_due:
+                self._write_frame()
+            elif self.idx != idx_before or len(self.paths) != paths_before:
+                self._write_frame()
             if need_redraw:
                 self.draw()
         pygame.quit()
