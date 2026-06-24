@@ -41,7 +41,8 @@ executables.
 | w | toggle wipe between the two most recently shown frames; mouse X positions the boundary |
 | f | toggle fullscreen |
 | h | toggle HUD / help |
-| click | pixel-pick (prints + displays BGR/RGB + HSV) |
+| t | toggle thumbnail strip (off by default — for FITS each thumb is a full decode, so the strip starts hidden; `-t` to start it on) |
+| click | on a thumbnail: show that frame; on the image: pixel-pick (prints + displays BGR/RGB + HSV) |
 | q / Esc | quit (selection list printed on exit) |
 
 ## Install
