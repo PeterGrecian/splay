@@ -18,7 +18,7 @@ Keys (always):
     w           toggle wipe between two most recently shown frames
     f           toggle fullscreen (image only — no overlay; HUD via h)
     h           toggle HUD / help
-    t           toggle thumbnail strip
+    t           toggle thumbnail strip (off by default; click a thumb to show it)
     r           reload changed / pick up new files in source dirs
     R           toggle auto-reload (rescans once a second; default off)
     0           fit image to window
@@ -76,6 +76,30 @@ def _splay_socket_path():
 SPLAY_SOCKET_PATH = _splay_socket_path()
 
 
+# ---- state protocol files ----------------------------------------------------
+# splay exposes (and, for `state`, accepts) its live state via three JSON files
+# in $HOME. Debuggable with `cat`/`jq`; readable by anything (me, a web control
+# page, another process). See design/splay-state-protocol.md for the full spec.
+#   state  — settings: bidirectional, write-on-change + read-every-frame
+#            (mtime-gated). Write it to DRIVE the visualisation.
+#   loaded — the loaded path list: write-on-load. "what's loaded".
+#   frame  — the cursor (idx/playing/...): write-often, coalesced.
+# Override the directory with $SPLAY_STATE_DIR (e.g. point it at a shared dir
+# for a multi-device control-plane / view-plane split).
+def _splay_state_dir():
+    d = os.environ.get("SPLAY_STATE_DIR")
+    return pathlib.Path(d) if d else pathlib.Path.home()
+
+SPLAY_STATE_DIR = _splay_state_dir()
+SPLAY_STATE_PATH = SPLAY_STATE_DIR / ".splay-state.json"
+SPLAY_LOADED_PATH = SPLAY_STATE_DIR / ".splay-loaded.json"
+SPLAY_FRAME_PATH = SPLAY_STATE_DIR / ".splay-frame.json"
+
+# Coalesce the high-churn frame-cursor file to at most this rate, so a remote
+# state backend (shared dir / HTTP) isn't hammered on every autoplay tick.
+FRAME_WRITE_HZ = 10
+
+
 def _send_ipc(msg):
     """Send one JSON command dict to a running splay. Returns True if
     delivered, False if no instance is listening."""
@@ -115,6 +139,7 @@ IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp",
             ".fits", ".fit", ".fts", ".fz"}
 FITS_EXTS = {".fits", ".fit", ".fts", ".fz"}
 THUMB_H = 80
+STATUS_H = 22  # top status-bar height (non-fullscreen); image area starts below it
 
 VIEW_INPUT = 0
 VIEW_WIPE = 1
@@ -122,6 +147,52 @@ VIEW_OUTPUT = 2
 VIEW_MASK = 3
 VIEW_NAMES = {VIEW_INPUT: "input", VIEW_WIPE: "wipe",
               VIEW_OUTPUT: "output", VIEW_MASK: "mask"}
+
+
+class StateStore:
+    """Backing store for splay's three state files (state/loaded/frame).
+
+    This is the seam that keeps splay's frame loop transport-agnostic: it is
+    backed by local JSON files here, but the same read/write interface can be
+    re-backed by a shared directory (NFS/syncthing → multi-device) or an HTTP
+    endpoint (→ over-internet web control plane) without touching splay.
+
+    Writes are atomic (temp + os.replace) so a reader never sees a half-written
+    file. Reads of `state` are mtime-gated by the caller — read_state() returns
+    (data, mtime) and the caller skips the JSON parse when mtime is unchanged.
+    """
+    def __init__(self, state_path, loaded_path, frame_path):
+        self.state_path = pathlib.Path(state_path)
+        self.loaded_path = pathlib.Path(loaded_path)
+        self.frame_path = pathlib.Path(frame_path)
+
+    def _write_atomic(self, path, obj):
+        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+        try:
+            with open(tmp, "w") as f:
+                json.dump(obj, f, indent=1, sort_keys=True)
+            os.replace(tmp, path)
+        except OSError as e:
+            print(f"state: write {path.name} failed: {e}", file=sys.stderr)
+            try: os.unlink(tmp)
+            except OSError: pass
+
+    def write_state(self, obj):  self._write_atomic(self.state_path, obj)
+    def write_loaded(self, obj): self._write_atomic(self.loaded_path, obj)
+    def write_frame(self, obj):  self._write_atomic(self.frame_path, obj)
+
+    def state_mtime(self):
+        try: return self.state_path.stat().st_mtime
+        except OSError: return None
+
+    def read_state(self):
+        """Return (data_dict, mtime) or (None, None) if absent/unreadable."""
+        try:
+            mtime = self.state_path.stat().st_mtime
+            with open(self.state_path) as f:
+                return json.load(f), mtime
+        except (OSError, ValueError):
+            return None, None
 
 
 def gather_paths(args):
@@ -247,7 +318,13 @@ def fits_array_to_surface(data, lo_pct=0.5, hi_pct=99.5):
         data8 = np.zeros(data.shape, dtype=np.uint8)
     else:
         vals = data[finite]
-        lo, hi = np.percentile(vals, [lo_pct, hi_pct])
+        # Subsample before percentile: a display stretch doesn't need exact
+        # percentiles, and np.percentile sorts the whole array (~100 ms on a
+        # 12 MP frame). Every ~16th finite pixel (>=~100k samples) gives a
+        # visually identical lo/hi for ~10x less cost. Small frames (< the
+        # stride threshold) use all pixels.
+        sample = vals[::16] if vals.size >= 1 << 16 else vals
+        lo, hi = np.percentile(sample, [lo_pct, hi_pct])
         if hi <= lo: hi = lo + 1.0
         norm = np.clip((data - lo) / (hi - lo), 0.0, 1.0)
         norm[~finite] = 0.0
@@ -257,25 +334,48 @@ def fits_array_to_surface(data, lo_pct=0.5, hi_pct=99.5):
     return pygame.surfarray.make_surface(rgb)
 
 
-_hot_pixel_mask_cache = {}  # path -> bool ndarray
+_hot_pixel_mask_cache = {}  # path -> bool ndarray (or None on load failure)
+_hot_pixel_mask_loading = set()  # keys with a load in flight (background thread)
 
-def get_hot_pixel_mask(path):
-    """Load hot-pixel mask FITS once, cache as bool array (non-zero = hot)."""
+def get_hot_pixel_mask(path, blocking=True, on_ready=None):
+    """Load hot-pixel mask FITS once, cache as bool array (non-zero = hot).
+
+    blocking=True  : load synchronously (original behaviour).
+    blocking=False : if not cached, kick a BACKGROUND load and return None now
+                     so the caller (first FITS render) doesn't wait on a cold
+                     NFS mount. `on_ready` is invoked (from the worker thread)
+                     once the mask is cached, so the caller can re-render.
+    """
     import numpy as np
     if path is None: return None
     key = str(path)
     if key in _hot_pixel_mask_cache:
         return _hot_pixel_mask_cache[key]
-    try:
-        arr = _read_fits_image(pathlib.Path(path))
-    except Exception as e:
-        print(f"hot-pixel mask: failed to load {path}: {e}", file=sys.stderr)
-        _hot_pixel_mask_cache[key] = None
-        return None
-    mask = arr != 0
-    _hot_pixel_mask_cache[key] = mask
-    print(f"hot-pixel mask: {path}  ({int(mask.sum())} hot px, {mask.shape[1]}×{mask.shape[0]})")
-    return mask
+
+    def _load():
+        try:
+            arr = _read_fits_image(pathlib.Path(path))
+            mask = arr != 0
+            _hot_pixel_mask_cache[key] = mask
+            print(f"hot-pixel mask: {path}  ({int(mask.sum())} hot px, "
+                  f"{mask.shape[1]}×{mask.shape[0]})")
+        except Exception as e:
+            print(f"hot-pixel mask: failed to load {path}: {e}", file=sys.stderr)
+            _hot_pixel_mask_cache[key] = None
+        finally:
+            _hot_pixel_mask_loading.discard(key)
+            if on_ready is not None:
+                try: on_ready()
+                except Exception: pass
+
+    if blocking:
+        _load()
+        return _hot_pixel_mask_cache.get(key)
+    # Non-blocking: ensure exactly one background load is in flight.
+    if key not in _hot_pixel_mask_loading:
+        _hot_pixel_mask_loading.add(key)
+        threading.Thread(target=_load, daemon=True).start()
+    return None
 
 
 def hot_pixel_count(path):
@@ -455,6 +555,11 @@ class Splay:
         self.sort_mode = "name"
         self._added_seq = 0
         self.added_order = {}  # path -> int (insertion sequence)
+        # mtime cache (see the deferred-stat note below). Declared here, before
+        # the first _sort_paths() call, so the mtime-sort branch can safely
+        # call _ensure_mtimes() regardless of init ordering.
+        self.mtimes = {}
+        self._mtimes_loaded = False
         for p in paths:
             self.added_order[p] = self._added_seq
             self._added_seq += 1
@@ -481,12 +586,22 @@ class Splay:
         # _show_current() appends; HUD reads len / window_seconds.
         from collections import deque
         self._paint_times = deque(maxlen=240)  # ~4s of headroom at 60fps
-        self.hot_pixel_mask_paths = self._discover_masks(hot_pixel_mask_path)
+        # Seed the mask path WITHOUT touching the filesystem — _discover_masks
+        # globs a secondary NFS mount and must not run on the startup path (see
+        # the note in main()). Sibling discovery is deferred to first use
+        # (_ensure_masks_discovered, called from step_mask). If the seed path
+        # turns out to be unreachable, the lazy load in get_hot_pixel_mask
+        # degrades gracefully.
+        seed = pathlib.Path(hot_pixel_mask_path) if hot_pixel_mask_path else None
+        self.hot_pixel_mask_paths = [seed] if seed else []
+        self._masks_discovered = False
         self.hot_pixel_mask_idx = 0
-        self.hot_pixel_mask_path = (self.hot_pixel_mask_paths[0]
-                                    if self.hot_pixel_mask_paths else None)
+        self.hot_pixel_mask_path = seed
         self.hot_pixel_mask_on = bool(self.hot_pixel_mask_path) and mask_on
         self.hot_pixel_highlight = highlight and bool(self.hot_pixel_mask_path)
+        # Set by the background mask loader (_mask_loaded) to ask the run loop
+        # to re-render once the mask arrives, without blocking first pixel.
+        self._mask_redraw_pending = False
 
         # FITS auto-stretch percentiles. 3 = darker, 4 = brighter (see
         # _adjust_stretch). JPEGs ignore this — they were stretched at
@@ -501,10 +616,10 @@ class Splay:
         self.source_dirs = list(source_dirs or [])
         self.auto_reload = auto_reload
         self.last_auto_scan = 0.0
-        self.mtimes = {}  # path -> float mtime at load time
-        for p in paths:
-            try: self.mtimes[p] = p.stat().st_mtime
-            except OSError: pass
+        # (mtime cache declared up top, before the first _sort_paths call.)
+        # Populated lazily via _ensure_mtimes(): stat()-ing every file up front
+        # cost ~0.7 s for ~300 frames over NFS, all before the first pixel, yet
+        # mtimes are only needed for mtime-sort and reload change-detection.
 
         # Single-instance IPC.
         self._ipc_lock = threading.Lock()
@@ -512,6 +627,20 @@ class Splay:
         self._ipc_commands = []  # list of command dicts (clear / key) from IPC
         self._ipc_sock = None
         self._start_ipc_server()
+
+        # State protocol (see design/splay-state-protocol.md). Three JSON files
+        # expose / accept our live state. _sync_state_out writes on change,
+        # _apply_state_in reads `state` (mtime-gated) so an external writer can
+        # drive the view. `version` orders writes across writers/devices.
+        self._store = StateStore(SPLAY_STATE_PATH, SPLAY_LOADED_PATH,
+                                 SPLAY_FRAME_PATH)
+        self._state_version = 0
+        self._last_state_written = None
+        self._last_loaded_written = None
+        self._state_seen_mtime = None
+        self._last_frame_written = None
+        self._last_frame_write_t = 0.0
+        self._frame_write_due = False
         self.selected = set()
         self.list_mode = list_mode
         self.idx = 0
@@ -571,6 +700,10 @@ class Splay:
         if not getattr(self, "_no_autoplay", False) and len(self.paths) > 1:
             self.toggle_play()
 
+        # Publish initial state so a controller/reader sees us immediately.
+        self._sync_state_out(force=True)
+        self._write_frame(force=True)
+
     # ---- sort ----
     SORT_MODES = ("name", "mtime", "added")
     SORT_LABELS = {"name": "name", "mtime": "age", "added": "added"}
@@ -579,6 +712,7 @@ class Splay:
         """Return `paths` ordered per current sort_mode. Stable across
         reloads so the user's position doesn't jitter between ticks."""
         if self.sort_mode == "mtime":
+            self._ensure_mtimes()  # fill the cache once for repeated sorts
             def key(p):
                 m = self.mtimes.get(p)
                 if m is None:
@@ -622,6 +756,19 @@ class Splay:
         if self._labels is None:
             self._labels = disambiguated_labels(self.paths)
         return self._labels.get(path, path.name)
+
+    def display_path(self, path):
+        """Full path for the status line, shown relative to $HOME as ~/… when
+        under home, else the absolute path."""
+        if path is None: return "—"
+        try:
+            home = pathlib.Path.home()
+            rp = path.resolve()
+            if rp == home or home in rp.parents:
+                return "~/" + str(rp.relative_to(home))
+            return str(rp)
+        except (OSError, ValueError):
+            return str(path)
 
     def _invalidate_labels(self):
         self._labels = None
@@ -687,7 +834,16 @@ class Splay:
     def _render_fits(self, path):
         import numpy as np
         data = self.fits_data[path]
-        mask = get_hot_pixel_mask(self.hot_pixel_mask_path) if self.hot_pixel_mask_path else None
+        # Only load the mask when it will actually be used, and NEVER block the
+        # render on it: loading touches a secondary NFS automount that, cold,
+        # stalled the first render ~9 s. Non-blocking load returns None now (so
+        # the first pixel shows unmasked immediately) and re-renders once the
+        # mask arrives via on_ready → _mask_loaded.
+        need_mask = (self.hot_pixel_mask_on or self.hot_pixel_highlight) \
+            and self.hot_pixel_mask_path is not None
+        mask = (get_hot_pixel_mask(self.hot_pixel_mask_path, blocking=False,
+                                   on_ready=self._mask_loaded)
+                if need_mask else None)
         if self.hot_pixel_mask_on and mask is not None:
             data = _apply_hot_pixel_mask(data, mask)
         surf = fits_array_to_surface(data, self.stretch_lo_pct,
@@ -700,6 +856,14 @@ class Splay:
             arr[mask_wh, 2] = 0
             del arr
         return surf
+
+    def _mask_loaded(self):
+        """Called from the background mask-load thread once the mask is cached.
+        Drop FITS surfaces so they re-render WITH the mask, and ask the run
+        loop to redraw. Only touches a flag + dict pops (safe enough across
+        threads here; the run loop reads the flag on its next tick)."""
+        self._invalidate_fits_surfaces()
+        self._mask_redraw_pending = True
 
     def toggle_hot_pixel_mask(self):
         if not self.hot_pixel_mask_path:
@@ -766,7 +930,22 @@ class Splay:
         siblings.remove(p)
         return [p] + siblings
 
+    def _ensure_masks_discovered(self):
+        """Run sibling-mask discovery once, lazily (it globs a secondary NFS
+        mount — kept off the startup path). Preserves the currently-selected
+        mask's position in the rediscovered list."""
+        if self._masks_discovered:
+            return
+        self._masks_discovered = True
+        seed = self.hot_pixel_mask_path
+        found = self._discover_masks(seed) if seed else []
+        if found:
+            self.hot_pixel_mask_paths = found
+            if seed in found:
+                self.hot_pixel_mask_idx = found.index(seed)
+
     def step_mask(self, delta):
+        self._ensure_masks_discovered()
         if not self.hot_pixel_mask_paths:
             print("no hot-pixel masks discovered")
             return
@@ -833,6 +1012,162 @@ class Splay:
 
     def _invalidate_processed(self):
         self.processed_cache.clear()
+
+    # ---- state protocol (see design/splay-state-protocol.md) ----
+    # Settings that go in `state`. write-on-change + read-every-frame
+    # (mtime-gated). External writers (web page, another process) may write
+    # this file to DRIVE the visualisation; we reconcile via a monotonic
+    # `version` + a `writer` id so a stale write can't clobber a newer change.
+    def _state_dict(self):
+        """The settings half of splay's state, minus version/writer (those are
+        added at write time). Compared as a dict to detect change."""
+        d = {
+            "sort_mode": self.sort_mode,
+            "list_mode": self.list_mode,
+            "show_strip": self.show_strip,
+            "show_hud": self.show_hud,
+            "show_regions": self.show_regions,
+            "fullscreen": self.fullscreen,
+            "zoom_mode": self.zoom_mode,
+            "hot_pixel_mask_on": self.hot_pixel_mask_on,
+            "hot_pixel_highlight": self.hot_pixel_highlight,
+            "hot_pixel_mask_idx": self.hot_pixel_mask_idx,
+            "stretch_lo_pct": round(self.stretch_lo_pct, 4),
+            "stretch_hi_pct": round(self.stretch_hi_pct, 4),
+            "auto_reload": self.auto_reload,
+            "selected": sorted(str(p) for p in self.selected),
+        }
+        if self.app:
+            d["app"] = self.app.NAME
+            d["view"] = VIEW_NAMES.get(self.view, "input")
+            d["params"] = dict(self.params)
+        return d
+
+    def _loaded_dict(self):
+        return {
+            "count": len(self.paths),
+            "paths": [str(p) for p in self.paths],
+            "source_dirs": [str(p) for p in self.source_dirs],
+            "version": self._state_version,
+            "writer": "renderer",
+        }
+
+    def _frame_dict(self):
+        return {
+            "idx": self.idx,
+            "current": str(self.curr_path) if self.curr_path else None,
+            "count": len(self.scope()),
+            "playing": self.playing,
+            "play_dir": self.play_dir,
+            "play_fps": self.play_fps,
+            "version": self._state_version,
+            "writer": "renderer",
+        }
+
+    def _sync_state_out(self, force=False):
+        """Write `state` and/or `loaded` if our settings or path list changed
+        since the last write. Cheap dict-compare gates the write so this can be
+        called once per event batch. Bumps `version` on every change so
+        external writers can detect/order against us."""
+        sd = self._state_dict()
+        if force or sd != self._last_state_written:
+            self._state_version += 1
+            out = dict(sd)
+            out["version"] = self._state_version
+            out["writer"] = "renderer"
+            self._store.write_state(out)
+            self._last_state_written = sd
+            # Our own write moves the mtime; record it so the next read-back
+            # doesn't mistake our write for an external one.
+            self._state_seen_mtime = self._store.state_mtime()
+        loaded_key = (tuple(str(p) for p in self.paths),
+                      tuple(str(p) for p in self.source_dirs))
+        if force or loaded_key != self._last_loaded_written:
+            self._store.write_loaded(self._loaded_dict())
+            self._last_loaded_written = loaded_key
+
+    def _write_frame(self, force=False):
+        """Write the high-churn cursor file, coalesced to FRAME_WRITE_HZ so a
+        remote backend isn't hammered every autoplay tick."""
+        now = time.monotonic()
+        key = (self.idx, str(self.curr_path), self.playing, self.play_dir,
+               self.play_fps)
+        if not force and key == self._last_frame_written:
+            return
+        if not force and (now - self._last_frame_write_t) < (1.0 / FRAME_WRITE_HZ):
+            self._frame_write_due = True   # let the run loop flush it soon
+            return
+        self._store.write_frame(self._frame_dict())
+        self._last_frame_written = key
+        self._last_frame_write_t = now
+        self._frame_write_due = False
+
+    def _apply_state_in(self):
+        """Read `state` (mtime-gated); if an EXTERNAL writer changed it, apply
+        the settings to the live view. Our own writes are ignored via mtime +
+        version. Called once per frame from the run loop."""
+        mtime = self._store.state_mtime()
+        if mtime is None or mtime == self._state_seen_mtime:
+            return  # unchanged since we last saw it → no parse, near-zero cost
+        data, mtime = self._store.read_state()
+        self._state_seen_mtime = mtime
+        if not data:
+            return
+        # Ignore our own writes (mtime already advanced past them in most
+        # cases; this is the belt-and-braces check).
+        if data.get("writer") == "renderer":
+            return
+        # Reject stale / out-of-order controller writes by version. A controller
+        # MUST write version > the current one (read it first). On reject we
+        # immediately re-publish our authoritative state so the stale file
+        # cannot linger and contaminate a later accepted write with its other
+        # field values.
+        ver = data.get("version")
+        if isinstance(ver, int) and ver <= self._state_version:
+            self._sync_state_out(force=True)
+            return
+        if isinstance(ver, int):
+            self._state_version = ver
+        self._apply_external_settings(data)
+
+    def _apply_external_settings(self, d):
+        """Apply a controller-supplied settings dict to the live view. Only
+        keys present are applied; unknown keys ignored. Re-renders as needed."""
+        changed_render = False
+        if "sort_mode" in d and d["sort_mode"] in self.SORT_MODES \
+                and d["sort_mode"] != self.sort_mode:
+            self.sort_mode = d["sort_mode"]
+            self.paths = self._sort_paths(self.paths)
+        if "list_mode" in d:    self.list_mode = bool(d["list_mode"])
+        if "show_strip" in d:   self.show_strip = bool(d["show_strip"])
+        if "show_hud" in d:     self.show_hud = bool(d["show_hud"])
+        if "show_regions" in d: self.show_regions = bool(d["show_regions"])
+        if "auto_reload" in d:  self.auto_reload = bool(d["auto_reload"])
+        if "zoom_mode" in d and d["zoom_mode"] in ("fit", "1x", "2x"):
+            self.zoom_mode = d["zoom_mode"]
+        if "hot_pixel_mask_on" in d and bool(d["hot_pixel_mask_on"]) != self.hot_pixel_mask_on:
+            self.hot_pixel_mask_on = bool(d["hot_pixel_mask_on"]) and bool(self.hot_pixel_mask_path)
+            changed_render = True
+        if "hot_pixel_highlight" in d and bool(d["hot_pixel_highlight"]) != self.hot_pixel_highlight:
+            self.hot_pixel_highlight = bool(d["hot_pixel_highlight"]) and bool(self.hot_pixel_mask_path)
+            changed_render = True
+        for pct in ("stretch_lo_pct", "stretch_hi_pct"):
+            if pct in d:
+                try:
+                    v = float(d[pct])
+                    if abs(v - getattr(self, pct)) > 1e-6:
+                        setattr(self, pct, v); changed_render = True
+                except (TypeError, ValueError): pass
+        if "selected" in d and isinstance(d["selected"], list):
+            self.selected = {pathlib.Path(s) for s in d["selected"]}
+        if "idx" in d:
+            try: self.next(int(d["idx"]) - self.idx)
+            except (TypeError, ValueError): pass
+        if changed_render:
+            self._invalidate_all_fits_renders()
+        # Reflect what we actually applied straight back out (write-on-change),
+        # so the file converges to our reconciled live state.
+        self._sync_state_out()
 
     # ---- nav ----
     def _show_current(self):
@@ -1008,10 +1343,23 @@ class Splay:
         self.wipe_on = not self.wipe_on
         if self.wipe_on: self.wipe_x = mouse_x
 
+    def _ensure_mtimes(self):
+        """Populate self.mtimes for all currently-loaded paths that lack an
+        entry. Deferred from __init__ (the eager stat()-all was ~0.7 s of
+        first-pixel latency over NFS); called on first reload / change-check."""
+        if self._mtimes_loaded:
+            return
+        for p in self.paths:
+            if p not in self.mtimes:
+                try: self.mtimes[p] = p.stat().st_mtime
+                except OSError: pass
+        self._mtimes_loaded = True
+
     def reload_changed(self, verbose=True):
         """Scan source dirs for new files and check mtimes on known paths.
         Invalidate caches for anything that changed; re-show current frame
         if its bytes changed."""
+        self._ensure_mtimes()  # change-detection (step 2) needs the baseline
         added = 0
         changed = 0
         # 1. Discover new files in source directories.
@@ -1307,12 +1655,25 @@ class Splay:
         ww, wh = self.screen.get_size()
         show_strip = self.show_strip and not self.fullscreen
         strip_h = THUMB_H + 24 if show_strip else 0
-        return pygame.Rect(0, 0, ww, max(1, wh - strip_h))
+        # Reserve the top status bar (non-fullscreen) so the image sits BELOW
+        # it, not behind it.
+        top = 0 if self.fullscreen else STATUS_H
+        return pygame.Rect(0, top, ww, max(1, wh - top - strip_h))
 
     def _set_zoom(self, mode, anchor):
         """Switch zoom mode while keeping the image pixel under `anchor`
         (screen-space x, y) pinned in place. For 'fit', pan is always 0."""
-        surf = self.load(self.curr_path) if self.curr_path else None
+        # Anchor against the SAME surface draw() will display in the target
+        # mode. For JPEGs that's the full-res decode when zoomed (load_full),
+        # vs the draft/downscaled load() in fit mode — using the wrong one made
+        # 2x anchor on the wrong part of the image. Compute with the target
+        # mode's surface, not the current one's.
+        if self.curr_path is None:
+            surf = None
+        elif mode != "fit" and self.curr_path.suffix.lower() not in FITS_EXTS:
+            surf = self.load_full(self.curr_path)
+        else:
+            surf = self.load(self.curr_path)
         if surf is None or mode == self.zoom_mode:
             self.zoom_mode = mode
             if mode == "fit":
@@ -1491,7 +1852,7 @@ class Splay:
         sc = self.scope()
         n = len(sc)
         mode = "LIST" if self.list_mode else "SEL "
-        name = self.display_name(self.curr_path)
+        name = self.display_path(self.curr_path)
         sel_mark = " ★" if self.curr_path in self.selected else "  "
         bits = [f"{mode}  [{self.idx+1}/{n}]  {name}{sel_mark}",
                 f"selected:{len(self.selected)}",
@@ -1508,7 +1869,7 @@ class Splay:
             bits.append(f"app:{self.app.NAME}  view:{VIEW_NAMES[self.view]}")
         msg = "  ".join(bits)
         ww = self.screen.get_width()
-        bar = pygame.Surface((ww, 22), pygame.SRCALPHA)
+        bar = pygame.Surface((ww, STATUS_H), pygame.SRCALPHA)
         bar.fill((0, 0, 0, 140))
         self.screen.blit(bar, (0, 0))
         self._draw_text((6, 3), msg, colour=(230, 230, 230))
@@ -1551,17 +1912,23 @@ class Splay:
         self.screen.blit(bar, (0, strip_y))
         sc = self.scope()
         if not sc: return
-        # Strip rendering: build thumbs for every on-screen slot in this
-        # draw (the user is looking at them) plus a small lookahead either
-        # side, built one-per-draw with the main loop polled to keep coming
-        # back until done. This keeps the UI responsive on huge FITS dirs.
+        # Strip rendering: thumbs are built a few per draw (budgeted), with the
+        # main loop polled (_thumbs_pending) to keep coming back until done.
+        # ON-screen slots are budgeted too — eagerly building every visible FITS
+        # thumb in the first draw cost ~2 s before first pixel (each FITS thumb
+        # is a full read+decode; JPEG thumbs are ~5 ms so this never bit them).
+        # Unbuilt slots draw as placeholders and fill in over the next frames.
+        # The current frame's own slot is always built (cheap: its full image is
+        # already decoded and cached).
         LOOKAHEAD = 2
+        ONSCREEN_BUDGET = 2   # new FITS thumbs to build per draw for visible slots
         nom_w = THUMB_H * 2  # placeholder width for unloaded thumbs
         slot_w = nom_w + 8
         offset_x = ww // 2 - (self.idx * slot_w + slot_w // 2)
         y = strip_y + 4
         self._thumbs_pending = False
         lookahead_budget = 1  # one off-screen thumb per draw, so we drift outward
+        onscreen_budget = ONSCREEN_BUDGET
         for i, p in enumerate(sc):
             x = offset_x + i * slot_w
             on_screen = not (x + slot_w < 0 or x > ww)
@@ -1576,7 +1943,14 @@ class Splay:
                 continue
             t = self.thumbs.get(p)
             if t is None:
-                t = self.thumb(p)
+                # Build now only if it's the current frame (always) or we still
+                # have on-screen budget this draw; otherwise placeholder + retry.
+                if i == self.idx or onscreen_budget > 0:
+                    t = self.thumb(p)
+                    if i != self.idx:
+                        onscreen_budget -= 1
+                else:
+                    self._thumbs_pending = True
             if t is None:
                 pygame.draw.rect(self.screen, (40, 40, 40),
                                  (x, y, nom_w, THUMB_H), 0)
@@ -1596,6 +1970,36 @@ class Splay:
             name = self.display_name(p)
             if len(name) > 16: name = "…" + name[-15:]
             self._draw_text((x, y + th + 2), name)
+
+    def _thumb_index_at(self, pos):
+        """If screen `pos` is over the thumbnail strip, return the scope index
+        of the slot under it, else None. Reverses the geometry in _draw_strip
+        (slots are slot_w wide, the current slot centred in the window)."""
+        if not self.show_strip or self.fullscreen:
+            return None
+        ww, wh = self.screen.get_size()
+        strip_y = wh - THUMB_H - 24
+        mx, my = pos
+        if my < strip_y or my > strip_y + THUMB_H + 24:
+            return None
+        sc = self.scope()
+        if not sc:
+            return None
+        nom_w = THUMB_H * 2
+        slot_w = nom_w + 8
+        offset_x = ww // 2 - (self.idx * slot_w + slot_w // 2)
+        i = (mx - offset_x) // slot_w
+        if 0 <= i < len(sc):
+            return int(i)
+        return None
+
+    def show_index(self, i):
+        """Jump to scope index i (clamped) and show it."""
+        sc = self.scope()
+        if not sc:
+            return
+        self.idx = max(0, min(len(sc) - 1, i))
+        self._show_current()
 
     def _draw_hud(self):
         sc = self.scope()
@@ -1639,7 +2043,7 @@ class Splay:
             f"a     sort: name / age / added  (now: {self.SORT_LABELS[self.sort_mode]})",
             "w     wipe between last 2 frames",
             "f     fullscreen (hides thumbnail strip)",
-            "t     thumbnail strip",
+            "t     thumbnail strip (off by default; click a thumb to show it)",
             "r / R reload now / auto-reload",
             "0 1 2 fit / 1:1 / 2× zoom",
             f"3 / 4 dark/bright  p{self.stretch_lo_pct:.1f}→{self.stretch_hi_pct:.2f}",
@@ -1847,8 +2251,16 @@ class Splay:
             self._advanced_this_batch = False  # transport: see ADVANCE_EVENT
             self._drain_ipc()
             self._drain_ipc_commands()  # clear / injected-key commands
+            # State protocol: pick up any EXTERNAL write to `state` (mtime-gated,
+            # so it's near-free when unchanged) and apply it to the live view.
+            self._apply_state_in()
             need_redraw = (len(self.paths) != paths_before or
                            self.idx != idx_before)
+            if self._mask_redraw_pending:
+                # Background mask load finished; re-render the current frame
+                # with the mask applied.
+                self._mask_redraw_pending = False
+                need_redraw = True
             if self.auto_reload and time.monotonic() - self.last_auto_scan >= 1.0:
                 self.last_auto_scan = time.monotonic()
                 added, changed = self.reload_changed(verbose=False)
@@ -1900,7 +2312,14 @@ class Splay:
                     self.pan_y += dy
                     self.drag_last = ev.pos
                 elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                    if self.wipe_on or (self.app and self.view == VIEW_WIPE):
+                    ti = self._thumb_index_at(ev.pos)
+                    if ti is not None:
+                        # Click a thumbnail → show that frame. Pause autoplay so
+                        # it stays put on the clicked frame.
+                        if self.playing:
+                            self.toggle_play()
+                        self.show_index(ti)
+                    elif self.wipe_on or (self.app and self.view == VIEW_WIPE):
                         pass
                     elif self.app:
                         self.on_click(ev.pos)
@@ -2072,6 +2491,16 @@ class Splay:
                             except Exception as e:
                                 msg = f"on_save failed: {e}"
                             print(msg or "saved")
+            # State protocol: publish our state. _sync_state_out is a cheap
+            # dict-compare (only writes `state`/`loaded` on real change);
+            # _write_frame is coalesced to FRAME_WRITE_HZ. _frame_write_due is
+            # set when a cursor change was throttled — flush it once the window
+            # has passed so the cursor file doesn't stall on the last move.
+            self._sync_state_out()
+            if self._frame_write_due:
+                self._write_frame()
+            elif self.idx != idx_before or len(self.paths) != paths_before:
+                self._write_frame()
             if need_redraw:
                 self.draw()
         pygame.quit()
@@ -2121,8 +2550,14 @@ def main():
                          "(equivalent to pressing 'm' once at startup)")
     ap.add_argument("--highlight", action="store_true",
                     help="start with hot-pixel red highlight on (toggle with 'M')")
-    ap.add_argument("-t", "--no-thumbnails", action="store_true",
-                    help="hide the thumbnail strip at startup (toggle with 't')")
+    ap.add_argument("-t", "--thumbnails", action="store_true",
+                    help="show the thumbnail strip at startup (off by default; "
+                         "toggle with 't'). For FITS each thumb is a full "
+                         "read+decode, which delays first pixel, so the strip "
+                         "starts hidden.")
+    # Back-compat: --no-thumbnails was the old flag (strip used to default on).
+    ap.add_argument("--no-thumbnails", action="store_true",
+                    help=argparse.SUPPRESS)
     ap.add_argument("--hud", action="store_true",
                     help="show the HUD/help overlay at startup (toggle with 'h')")
     ap.add_argument("-f", "--fullscreen", action="store_true",
@@ -2193,20 +2628,17 @@ def main():
     if not paths:
         sys.exit("no images found")
     print(f"loaded {len(paths)} image(s). h = help.")
+    # NB: do NOT probe the mask path here. The default lives on a secondary
+    # NFS automount (starcam-frames); a blocking is_file() on a cold/failing
+    # mount cost ~12 s of first-pixel latency before the window even opened
+    # (Errno 19 + automount retry). The mask is loaded lazily on first FITS
+    # render (get_hot_pixel_mask handles a missing/unreachable file), and
+    # sibling discovery is deferred too — so startup never touches the mount.
     mask_path = args.hot_pixel_mask or None
-    if mask_path:
-        try:
-            ok = pathlib.Path(mask_path).is_file()
-        except OSError as e:
-            print(f"warning: hot-pixel mask unreachable ({e}): {mask_path}",
-                  file=sys.stderr)
-            ok = False
-        if not ok:
-            mask_path = None
     Splay(paths, app=app, hot_pixel_mask_path=mask_path,
           mask_on=not args.no_mask,
           highlight=args.highlight,
-          show_strip=not args.no_thumbnails,
+          show_strip=args.thumbnails,
           show_hud=args.hud,
           fullscreen=args.fullscreen,
           list_mode=not args.selected_mode,
