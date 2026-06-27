@@ -1662,39 +1662,35 @@ class Splay:
 
     def _set_zoom(self, mode, anchor):
         """Switch zoom mode while keeping the image pixel under `anchor`
-        (screen-space x, y) pinned in place. For 'fit', pan is always 0."""
-        # Anchor against the SAME surface draw() will display in the target
-        # mode. For JPEGs that's the full-res decode when zoomed (load_full),
-        # vs the draft/downscaled load() in fit mode — using the wrong one made
-        # 2x anchor on the wrong part of the image. Compute with the target
-        # mode's surface, not the current one's.
-        if self.curr_path is None:
-            surf = None
-        elif mode != "fit" and self.curr_path.suffix.lower() not in FITS_EXTS:
-            surf = self.load_full(self.curr_path)
-        else:
-            surf = self.load(self.curr_path)
-        if surf is None or mode == self.zoom_mode:
+        (screen-space x, y) pinned in place. For 'fit', pan is always 0.
+
+        Works in FRACTIONAL image coords (0..1), not pixels. The fit-mode
+        surface is the downscaled cache; the zoomed view uses the full-res
+        decode (see _surface_for_view) — different pixel dimensions. The old
+        code read the anchor pixel off the fit surface but sized the zoom
+        rect in full-res pixels, so the anchor landed in the wrong place
+        (the zoom-to-mouse bug). A fraction is resolution-independent and
+        carries cleanly between the two surfaces."""
+        cur_surf = self._surface_for_view()
+        if cur_surf is None:
             self.zoom_mode = mode
-            if mode == "fit":
-                self.pan_x = self.pan_y = 0
+            self.pan_x = self.pan_y = 0
             return
-        old = self.image_blit_rect(surf)
-        iw, ih = surf.get_width(), surf.get_height()
+        old = self.image_blit_rect(cur_surf)
         mx, my = anchor
         if not old.collidepoint(mx, my):
             mx, my = old.centerx, old.centery
-        img_px = (mx - old.x) * iw / old.w
-        img_py = (my - old.y) * ih / old.h
+        fx = min(1.0, max(0.0, (mx - old.x) / old.w))
+        fy = min(1.0, max(0.0, (my - old.y) / old.h))
         self.zoom_mode = mode
         if mode == "fit":
             self.pan_x = self.pan_y = 0
             return
+        # Place the zoomed image so fraction (fx,fy) lands under (mx,my).
         self.pan_x = self.pan_y = 0
-        base = self.image_blit_rect(surf)  # centred, pan=0
-        new_w, new_h = base.w, base.h
-        self.pan_x = int(round(mx - base.x - img_px * new_w / iw))
-        self.pan_y = int(round(my - base.y - img_py * new_h / ih))
+        base = self.image_blit_rect(self._surface_for_view())  # new mode, centred
+        self.pan_x = int(round(mx - base.x - fx * base.w))
+        self.pan_y = int(round(my - base.y - fy * base.h))
 
     def image_blit_rect(self, surf):
         area = self.display_area()
@@ -2102,13 +2098,23 @@ class Splay:
     def on_click(self, screen_pos, quiet=False):
         cur = self.curr_path
         if not cur: return
-        surf = self.load(cur)
+        # Use the SAME surface the display uses (full-res when zoomed,
+        # draft when fit) so the hit-test rect matches what's on screen.
+        # Using self.load() here computed the rect off the fit/draft
+        # surface even when zoomed -> the collision test was wrong and a
+        # p-probe over the (zoomed) image silently missed.
+        surf = self._surface_for_view() or self.load(cur)
         if surf is None: return
         target = self.image_blit_rect(surf)
         sx, sy = screen_pos
         if not target.collidepoint(sx, sy):
             if quiet:
                 self.click_info = None
+            elif not quiet:
+                # Don't fail silently: a p-probe with the mouse off the
+                # image (letterbox margin / strip) was dropping points.
+                print("probe: mouse not over image (move onto it, press p)",
+                      file=sys.stderr, flush=True)
             return
         u = (sx - target.x) / target.w
         v = (sy - target.y) / target.h
@@ -2151,12 +2157,20 @@ class Splay:
             print(probe_line, flush=True)
             # Also ALWAYS append to a fixed log, so probe positions are
             # readable regardless of how splay was launched (no need to
-            # pipe/tee). Best-effort; never let logging break the probe.
+            # pipe/tee). The log records the ABSOLUTE path — when splay is
+            # launched from inside a frame dir (e.g. `splay 20`) the relative
+            # path on stdout ("20/0033.jpg") loses the camera/night, so the
+            # log alone couldn't tell v1 from v3w. Resolve it. Best-effort;
+            # never let logging break the probe.
             try:
                 from datetime import datetime as _dt
+                try:
+                    abs_path = pathlib.Path(cur).resolve()
+                except OSError:
+                    abs_path = cur
                 with open(PROBE_LOG, "a") as _pf:
                     _pf.write(f"{_dt.now().isoformat(timespec='seconds')} "
-                              f"{probe_line}  RGB=({r},{g},{b})\n")
+                              f"PROBE {abs_path} {ix} {iy}  RGB=({r},{g},{b})\n")
             except OSError:
                 pass
 
@@ -2350,6 +2364,16 @@ class Splay:
                     AUTOREPEAT_KEYS = {pygame.K_3, pygame.K_4,
                                        pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET,
                                        pygame.K_COMMA, pygame.K_PERIOD}
+                    # p has "once per cursor position" semantics: a genuine
+                    # new mark always moves the cursor first. So let a held p
+                    # through if the mouse has moved since the last probe —
+                    # this both re-arms p after a missed KEYUP (the latch that
+                    # made p "intermittent") AND suppresses key-repeat
+                    # machine-gunning at a single spot (move = new, still = no).
+                    if k == pygame.K_p:
+                        mpos = pygame.mouse.get_pos()
+                        if mpos != getattr(self, "_last_probe_mouse", None):
+                            self._keys_held.discard(pygame.K_p)
                     if k in self._keys_held and k not in AUTOREPEAT_KEYS:
                         continue
                     self._keys_held.add(k)
@@ -2403,8 +2427,24 @@ class Splay:
                         # (full path + x,y + RGB/HSV + a PROBE parse line)
                         # and shows it on-screen. Press again at a new
                         # mouse position to print that one. No silent mode.
+                        #
+                        # on_click() returns silently when the cursor is off
+                        # the image blit rect (letterbox margins, HUD/strip,
+                        # or after a zoom/pan shift). That looked like "p
+                        # doesn't work" — so warn instead of failing silently.
                         self.pixel_probe_mode = "snapshot"
-                        self.on_click(pygame.mouse.get_pos())
+                        mpos = pygame.mouse.get_pos()
+                        self._last_probe_mouse = mpos
+                        surf = self.load(self.curr_path) if self.curr_path else None
+                        on_img = (surf is not None and
+                                  self.image_blit_rect(surf).collidepoint(*mpos))
+                        if on_img:
+                            self.on_click(mpos)
+                        else:
+                            self.click_info = None
+                            print("  p: cursor not over the image — "
+                                  "move onto the target and press p again",
+                                  flush=True)
                     elif k == pygame.K_m:
                         if mods & pygame.KMOD_SHIFT:
                             self.toggle_hot_pixel_highlight()
