@@ -1763,12 +1763,20 @@ class Splay:
             print(probe_line, flush=True)
             # Also ALWAYS append to a fixed log, so probe positions are
             # readable regardless of how splay was launched (no need to
-            # pipe/tee). Best-effort; never let logging break the probe.
+            # pipe/tee). The log records the ABSOLUTE path — when splay is
+            # launched from inside a frame dir (e.g. `splay 20`) the relative
+            # path on stdout ("20/0033.jpg") loses the camera/night, so the
+            # log alone couldn't tell v1 from v3w. Resolve it. Best-effort;
+            # never let logging break the probe.
             try:
                 from datetime import datetime as _dt
+                try:
+                    abs_path = pathlib.Path(cur).resolve()
+                except OSError:
+                    abs_path = cur
                 with open(PROBE_LOG, "a") as _pf:
                     _pf.write(f"{_dt.now().isoformat(timespec='seconds')} "
-                              f"{probe_line}  RGB=({r},{g},{b})\n")
+                              f"PROBE {abs_path} {ix} {iy}  RGB=({r},{g},{b})\n")
             except OSError:
                 pass
 
@@ -1947,6 +1955,16 @@ class Splay:
                     AUTOREPEAT_KEYS = {pygame.K_3, pygame.K_4,
                                        pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET,
                                        pygame.K_COMMA, pygame.K_PERIOD}
+                    # p has "once per cursor position" semantics: a genuine
+                    # new mark always moves the cursor first. So let a held p
+                    # through if the mouse has moved since the last probe —
+                    # this both re-arms p after a missed KEYUP (the latch that
+                    # made p "intermittent") AND suppresses key-repeat
+                    # machine-gunning at a single spot (move = new, still = no).
+                    if k == pygame.K_p:
+                        mpos = pygame.mouse.get_pos()
+                        if mpos != getattr(self, "_last_probe_mouse", None):
+                            self._keys_held.discard(pygame.K_p)
                     if k in self._keys_held and k not in AUTOREPEAT_KEYS:
                         continue
                     self._keys_held.add(k)
@@ -2000,8 +2018,24 @@ class Splay:
                         # (full path + x,y + RGB/HSV + a PROBE parse line)
                         # and shows it on-screen. Press again at a new
                         # mouse position to print that one. No silent mode.
+                        #
+                        # on_click() returns silently when the cursor is off
+                        # the image blit rect (letterbox margins, HUD/strip,
+                        # or after a zoom/pan shift). That looked like "p
+                        # doesn't work" — so warn instead of failing silently.
                         self.pixel_probe_mode = "snapshot"
-                        self.on_click(pygame.mouse.get_pos())
+                        mpos = pygame.mouse.get_pos()
+                        self._last_probe_mouse = mpos
+                        surf = self.load(self.curr_path) if self.curr_path else None
+                        on_img = (surf is not None and
+                                  self.image_blit_rect(surf).collidepoint(*mpos))
+                        if on_img:
+                            self.on_click(mpos)
+                        else:
+                            self.click_info = None
+                            print("  p: cursor not over the image — "
+                                  "move onto the target and press p again",
+                                  flush=True)
                     elif k == pygame.K_m:
                         if mods & pygame.KMOD_SHIFT:
                             self.toggle_hot_pixel_highlight()
