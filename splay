@@ -138,6 +138,30 @@ PROBE_LOG = pathlib.Path(
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp",
             ".fits", ".fit", ".fts", ".fz"}
 FITS_EXTS = {".fits", ".fit", ".fts", ".fz"}
+
+
+def _frame_capture_utc(path):
+    """Frame CAPTURE time as an ISO string (no tz), or None. JPEG:
+    EXIF DateTimeOriginal. FITS: epoch_ms filename (astro night frames).
+    Read at probe time so the probe log stays usable after the frame is
+    deleted. Best-effort — never raises."""
+    p = pathlib.Path(path)
+    try:
+        if p.suffix.lower() in FITS_EXTS:
+            import datetime as _d
+            ms = int(p.name.split(".")[0])
+            return _d.datetime.fromtimestamp(
+                ms / 1000, _d.timezone.utc).replace(tzinfo=None).isoformat()
+        from PIL import Image
+        from PIL.ExifTags import TAGS
+        ex = Image.open(str(p))._getexif() or {}
+        s = {TAGS.get(k): v for k, v in ex.items()}.get("DateTimeOriginal")
+        if not s:
+            return None
+        import datetime as _d
+        return _d.datetime.strptime(s, "%Y:%m:%d %H:%M:%S").isoformat()
+    except Exception:
+        return None
 THUMB_H = 80
 STATUS_H = 22  # top status-bar height (non-fullscreen); image area starts below it
 
@@ -566,6 +590,7 @@ class Splay:
         self.paths = self._sort_paths(paths)
         self.images = {}     # path -> pygame.Surface (lazy)
         self.fits_data = {}  # path -> raw float32 ndarray (FITS only)
+        self._native_size_cache = {}  # path -> (w, h) native, header-only
         self.thumbs = {}
 
         # Transport: Space toggles playing; the timer fires
@@ -830,6 +855,26 @@ class Splay:
             return None
         self._full_res_cache = (path, surf)
         return surf
+
+    def native_size(self, path):
+        """Native (full-resolution) pixel size of `path`, WITHOUT a full
+        decode. JPEGs are read from the header via PIL (`.size` doesn't
+        decode pixels); FITS is read from the cached array shape. Cached
+        per-path. Used to rescale p-probe coords to full-res so a probe
+        means the same pixel regardless of zoom mode or window size — the
+        fit/2x surfaces are draft-downscaled (see load()), 1x is native."""
+        cache = self._native_size_cache
+        if path not in cache:
+            try:
+                if path.suffix.lower() in FITS_EXTS:
+                    h, w = self.fits_data[path].shape[:2]
+                    cache[path] = (w, h)
+                else:
+                    with Image.open(str(path)) as im:
+                        cache[path] = im.size  # (w, h), header-only
+            except Exception:
+                cache[path] = None
+        return cache[path]
 
     def _render_fits(self, path):
         import numpy as np
@@ -2122,6 +2167,20 @@ class Splay:
         ix = max(0, min(iw - 1, int(u * iw)))
         iy = max(0, min(ih - 1, int(v * ih)))
         col = surf.get_at((ix, iy))
+        # ix,iy are in SURFACE space, which may be draft-downscaled in fit/2x
+        # mode (v3w 4608->2304 at a 1080p window) — so the same click gives
+        # different numbers per zoom/window. Rescale to NATIVE full-res so a
+        # probe means one pixel regardless of view. All REPORTED coords (on
+        # screen, stdout, probe log) use fx,fy; ix,iy stay surface-space for
+        # get_at / the hot-pixel mask (both indexed on the surface).
+        nat = self.native_size(cur)
+        if nat and (nat != (iw, ih)):
+            nw, nh = nat
+            fx = max(0, min(nw - 1, int(u * nw)))
+            fy = max(0, min(nh - 1, int(v * nh)))
+        else:
+            nw, nh = iw, ih
+            fx, fy = ix, iy
         r, g, b = col.r, col.g, col.b
         hh, ss, vv = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
         # Capture context: frame, mask state, and whether this pixel is a hot
@@ -2138,7 +2197,7 @@ class Splay:
             m = get_hot_pixel_mask(self.hot_pixel_mask_path)
             if m is not None and 0 <= iy < m.shape[0] and 0 <= ix < m.shape[1]:
                 is_hot = bool(m[iy, ix])
-        self.click_info = (ix, iy, (b, g, r), (hh, ss, vv),
+        self.click_info = (fx, fy, (b, g, r), (hh, ss, vv),
                            frame_label, mask_label, is_hot)
         if not quiet:
             hot_tag = ""
@@ -2149,11 +2208,12 @@ class Splay:
             # it reaches a pipe immediately (e.g. `splay ... | tee log`).
             print(f"  {cur} [{self.idx+1}/{len(self.scope())}]  "
                   f"{mask_label}{hot_tag}", flush=True)
-            print(f"  ({ix},{iy})  RGB=({r},{g},{b})  "
+            print(f"  ({fx},{fy})  RES={nw}x{nh}  RGB=({r},{g},{b})  "
                   f"HSV=({int(hh*180)},{int(ss*255)},{int(vv*255)})",
                   flush=True)
-            # Machine-readable line for piping/parsing: PROBE <path> <x> <y>
-            probe_line = f"PROBE {cur} {ix} {iy}"
+            # Machine-readable line for piping/parsing: PROBE <path> <x> <y>.
+            # Coords are NATIVE full-res (RES=WxH), not the on-screen surface.
+            probe_line = f"PROBE {cur} {fx} {fy}"
             print(probe_line, flush=True)
             # Also ALWAYS append to a fixed log, so probe positions are
             # readable regardless of how splay was launched (no need to
@@ -2168,9 +2228,16 @@ class Splay:
                     abs_path = pathlib.Path(cur).resolve()
                 except OSError:
                     abs_path = cur
+                # Capture UTC of the frame, read NOW while the file certainly
+                # exists — downstream (moon-net ingest) needs the frame's time
+                # but the frame is often deleted right after marking. CAP= makes
+                # a probe self-sufficient: no re-reading the frame later.
+                cap = _frame_capture_utc(cur)
+                cap_field = f"  CAP={cap}" if cap else ""
                 with open(PROBE_LOG, "a") as _pf:
                     _pf.write(f"{_dt.now().isoformat(timespec='seconds')} "
-                              f"PROBE {abs_path} {ix} {iy}  RGB=({r},{g},{b})\n")
+                              f"PROBE {abs_path} {fx} {fy}  "
+                              f"RES={nw}x{nh}{cap_field}  RGB=({r},{g},{b})\n")
             except OSError:
                 pass
 
@@ -2435,7 +2502,13 @@ class Splay:
                         self.pixel_probe_mode = "snapshot"
                         mpos = pygame.mouse.get_pos()
                         self._last_probe_mouse = mpos
-                        surf = self.load(self.curr_path) if self.curr_path else None
+                        # Gate on the SAME surface on_click() uses. In 1x/2x
+                        # that's the full-res surface (via _surface_for_view),
+                        # whose size differs from the draft load() surface — so
+                        # gating on load() computed the blit rect at the wrong
+                        # size and wrongly rejected on-image clicks when zoomed.
+                        surf = (self._surface_for_view()
+                                if self.curr_path else None)
                         on_img = (surf is not None and
                                   self.image_blit_rect(surf).collidepoint(*mpos))
                         if on_img:
