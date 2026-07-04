@@ -10,6 +10,8 @@ Usage:
 
 Keys (always):
     ← →         previous / next frame  (Shift = ±20, ≈1 min at 3s cadence)
+    Space       play / pause  (, . set reverse / forward; Shift = slower / faster)
+    v           slow study play (2 fps forward) — press again to pause
     s           select current frame
     d           deselect current frame
     l           toggle list mode / selected-only mode
@@ -1276,7 +1278,9 @@ class Splay:
         play_fps and re-arms the timer if currently playing so the new
         rate takes effect immediately."""
         BASE = 60
-        STEPS = [BASE // 4, BASE // 2, BASE, BASE * 2, BASE * 4]
+        # Slow study speeds (2/4/8 fps) prepended so Shift+,/Shift+. can
+        # slow all the way down for studying sequences frame-by-frame.
+        STEPS = [2, 4, 8, BASE // 4, BASE // 2, BASE, BASE * 2, BASE * 4]
         # Find the nearest current step
         cur = min(range(len(STEPS)), key=lambda i: abs(STEPS[i] - self.play_fps))
         new = max(0, min(len(STEPS) - 1, cur + delta))
@@ -1302,6 +1306,29 @@ class Splay:
         else:
             pygame.time.set_timer(ADVANCE_EVENT, 0)
             print("pause", flush=True)
+
+    STUDY_FPS = 2
+
+    def study_play(self):
+        """v = slow study play. Toggles a fixed 2 fps forward playback for
+        studying sequences frame-by-frame. Pressing v while already study-
+        playing pauses; pressing it while paused (or playing at another
+        rate) forces play_dir forward, sets 2 fps, and starts. Distinct
+        from Space, which plays at whatever play_fps is currently set."""
+        already_studying = (self.playing and self.play_dir == +1
+                            and self.play_fps == self.STUDY_FPS)
+        if already_studying:
+            self.toggle_play()   # pause
+            return
+        self.play_dir = +1
+        self.play_fps = self.STUDY_FPS
+        if self.playing:
+            # Already playing at another rate/dir — just re-arm at 2 fps.
+            interval_ms = max(1, int(1000 / self.STUDY_FPS))
+            pygame.time.set_timer(ADVANCE_EVENT, interval_ms)
+            print(f"study: dir=+1 target_fps={self.STUDY_FPS}", flush=True)
+        else:
+            self.toggle_play()   # starts at the play_fps we just set
 
     def remove_current(self):
         """Drop the current path from the list (does not touch disk).
@@ -2456,6 +2483,8 @@ class Splay:
                     #           stops if already playing forward)
                     elif k == pygame.K_SPACE:
                         self.toggle_play()
+                    elif not self.app and k == pygame.K_v:
+                        self.study_play()   # slow 2 fps study play/pause
                     elif k == pygame.K_COMMA and not (mods & pygame.KMOD_SHIFT):
                         if self.playing and self.play_dir == -1:
                             self.toggle_play()
