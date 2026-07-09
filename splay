@@ -37,7 +37,14 @@ Keys (always):
     z / x       step backward / forward through sibling masks
                 (siblings = hot-pixels-*.fits.fz next to the seed mask)
     g           open current frame in GIMP (FITS exported to PNG first)
-    o           toggle DS9 .reg overlay (auto-loaded from sidecar)
+    o           toggle DS9 .reg overlay (auto-loaded from sidecar).
+                Supports circle/point/box/line/polygon shapes. Overlay is
+                resolved most-specific-wins over a scope ladder:
+                frame → sequence → day → epoch (since last camera move).
+    O           cycle forced overlay scope: auto → frame → sequence → day
+                → epoch → auto (drop to a broader overlay on demand)
+    Ctrl-o      cycle overlay layer: all → each tag={...} group → all
+                (e.g. graticule, starnames) — filters the overlay by tag
     Delete      remove current frame from the list (does not touch disk)
     L-drag      pan the image when zoomed (1x / 2x)
     q           quit
@@ -443,6 +450,7 @@ def parse_reg_file(path):
     coord_sys = "image"  # default
     text_re = _re.compile(r"text\s*=\s*\{([^}]*)\}")
     color_re = _re.compile(r"color\s*=\s*(\S+)")
+    tag_re = _re.compile(r"tag\s*=\s*\{([^}]*)\}")
     nums_re = _re.compile(r"-?\d+(?:\.\d+)?")
     try:
         lines = path.read_text().splitlines()
@@ -476,6 +484,9 @@ def parse_reg_file(path):
                                    if color_re.search(comment) else None)
         text_m = text_re.search(comment)
         text = text_m.group(1) if text_m else None
+        tag_m = tag_re.search(comment)
+        tag = tag_m.group(1) if tag_m else None
+        n_before = len(shapes)
         if kind == "circle" and len(nums) >= 3:
             shapes.append({"kind": "circle", "x": nums[0], "y": nums[1],
                            "r": nums[2], "colour": colour, "text": text})
@@ -487,27 +498,86 @@ def parse_reg_file(path):
             shapes.append({"kind": "box", "x": nums[0], "y": nums[1],
                            "w": nums[2], "h": nums[3], "angle": angle,
                            "colour": colour, "text": text})
-        # else: silently skip polygon/ellipse/line/vector for now
+        elif kind in ("line", "vector") and len(nums) >= 4:
+            # line(x1,y1,x2,y2) — a single segment. vector shares the geometry.
+            shapes.append({"kind": "line", "x1": nums[0], "y1": nums[1],
+                           "x2": nums[2], "y2": nums[3],
+                           "colour": colour, "text": text})
+        elif kind == "polygon" and len(nums) >= 6:
+            # polygon(x1,y1,x2,y2,...) — draw as a connected polyline (not
+            # auto-closed; repeat the first vertex in the .reg to close).
+            pts = list(zip(nums[0::2], nums[1::2]))
+            shapes.append({"kind": "polyline", "pts": pts,
+                           "colour": colour, "text": text})
+        # else: silently skip ellipse and other shapes for now
+        # Attach the layer tag (if any) to whatever shape this line produced.
+        for sh in shapes[n_before:]:
+            sh["tag"] = tag
     return shapes
 
 
+# Overlay scope ladder, most-specific first. Each entry names how to locate
+# that scope's .reg file relative to the frame being shown. A ".reg" overlay
+# applies to a widening region of sky:
+#   frame     — this exact image        (foo.reg beside foo.jpg)
+#   sequence  — this capture run / dir   (_sequence.reg in the frame's dir)
+#   day       — this night              (_day.reg walking up to the night root)
+#   epoch     — since last camera move   (_epoch.reg beside a camera-move marker)
+# Resolution is most-specific-wins: the first scope with a file present is used.
+# A frame overlay overrides the epoch one.
+OVERLAY_SCOPES = ("frame", "sequence", "day", "epoch")
+
+
+def _scope_reg_candidates(path, scope):
+    """Yield candidate .reg Paths for `scope` given the frame `path`, nearest
+    first. `day`/`epoch` walk up the directory tree looking for the marker."""
+    if path is None:
+        return
+    if scope == "frame":
+        yield path.with_suffix(".reg")
+        if path.suffix.lower() == ".fz":          # foo.fits.fz → foo.reg
+            yield path.with_suffix("").with_suffix(".reg")
+    elif scope == "sequence":
+        yield path.parent / "_sequence.reg"
+    elif scope == "day":
+        # Nearest _day.reg walking up from the frame's directory.
+        for d in [path.parent, *path.parents]:
+            yield d / "_day.reg"
+    elif scope == "epoch":
+        # Nearest _epoch.reg; the marker file (camera-move.json / _epoch.reg
+        # itself) sits at the top of the current camera-epoch tree.
+        for d in [path.parent, *path.parents]:
+            yield d / "_epoch.reg"
+
+
+def _load_reg_cached(regpath):
+    key = str(regpath)
+    if key not in _reg_cache:
+        _reg_cache[key] = parse_reg_file(regpath)
+        n = len(_reg_cache[key])
+        print(f"reg: loaded {n} shape(s) from {regpath}")
+    return _reg_cache[key]
+
+
+def resolve_reg_for(path, forced_scope=None):
+    """Resolve the overlay for `path`, most-specific-wins.
+
+    Returns (scope_name, shapes). With forced_scope set, only that scope is
+    consulted (lets the user step down to a broader overlay even when a more
+    specific one exists). Returns (None, []) when nothing is found."""
+    if path is None:
+        return (None, [])
+    scopes = (forced_scope,) if forced_scope else OVERLAY_SCOPES
+    for scope in scopes:
+        for c in _scope_reg_candidates(path, scope):
+            if c.is_file():
+                return (scope, _load_reg_cached(c))
+    return (None, [])
+
+
 def load_reg_for(path):
-    """Return parsed shapes for the .reg sidecar of `path`, or [].
-    Sidecar = same stem with .reg (handles .fits.fz → strip .fz too)."""
-    if path is None: return []
-    candidates = [path.with_suffix(".reg")]
-    # foo.fits.fz → foo.fits → foo.reg
-    if path.suffix.lower() == ".fz":
-        candidates.append(path.with_suffix("").with_suffix(".reg"))
-    for c in candidates:
-        if c.is_file():
-            key = str(c)
-            if key not in _reg_cache:
-                _reg_cache[key] = parse_reg_file(c)
-                n = len(_reg_cache[key])
-                print(f"reg: loaded {n} shape(s) from {c.name}")
-            return _reg_cache[key]
-    return []
+    """Back-compat: shapes for the most-specific overlay of `path`, or []."""
+    return resolve_reg_for(path)[1]
 
 
 def _ensure_np_cv2():
@@ -686,6 +756,14 @@ class Splay:
         # → "live" (follows the mouse, no console spam) → "off".
         self.pixel_probe_mode = "off"
         self.show_regions = show_regions
+        # Overlay scope: None = auto (most-specific-wins). Otherwise forced to
+        # one of OVERLAY_SCOPES so the user can step down to a broader overlay
+        # (e.g. the day/epoch graticule) even when a frame overlay exists.
+        self.overlay_scope = None
+        self._active_overlay_scope = None   # what actually drew last frame
+        # Overlay layer filter: None = show all tags; otherwise only shapes
+        # whose tag={...} matches are drawn. Ctrl-o cycles all → each layer.
+        self.overlay_layer = None
         self.fullscreen = fullscreen
         self.zoom_mode = "fit"   # "fit", "1x", "2x"
         self.pan_x = 0
@@ -1074,6 +1152,8 @@ class Splay:
             "show_strip": self.show_strip,
             "show_hud": self.show_hud,
             "show_regions": self.show_regions,
+            "overlay_scope": self.overlay_scope,
+            "overlay_layer": self.overlay_layer,
             "fullscreen": self.fullscreen,
             "zoom_mode": self.zoom_mode,
             "hot_pixel_mask_on": self.hot_pixel_mask_on,
@@ -1189,6 +1269,11 @@ class Splay:
         if "show_strip" in d:   self.show_strip = bool(d["show_strip"])
         if "show_hud" in d:     self.show_hud = bool(d["show_hud"])
         if "show_regions" in d: self.show_regions = bool(d["show_regions"])
+        if "overlay_scope" in d:
+            v = d["overlay_scope"]
+            self.overlay_scope = v if v in OVERLAY_SCOPES else None
+        if "overlay_layer" in d:
+            self.overlay_layer = d["overlay_layer"] or None
         if "auto_reload" in d:  self.auto_reload = bool(d["auto_reload"])
         if "zoom_mode" in d and d["zoom_mode"] in ("fit", "1x", "2x"):
             self.zoom_mode = d["zoom_mode"]
@@ -1432,6 +1517,8 @@ class Splay:
         Invalidate caches for anything that changed; re-show current frame
         if its bytes changed."""
         self._ensure_mtimes()  # change-detection (step 2) needs the baseline
+        # Drop cached .reg parses so edited overlays are picked up on reload.
+        _reg_cache.clear()
         added = 0
         changed = 0
         # 1. Discover new files in source directories.
@@ -1877,11 +1964,53 @@ class Splay:
         surf = f.render(text, True, colour)
         self.screen.blit(surf, pos)
 
+    def cycle_overlay_scope(self):
+        """Step the forced overlay scope: auto → frame → sequence → day →
+        epoch → auto. 'auto' is most-specific-wins; forcing a scope lets you
+        drop to a broader overlay even when a narrower one exists. Turns the
+        overlay on if it was off, so the cycle is always visible."""
+        ladder = (None,) + OVERLAY_SCOPES
+        try:
+            i = ladder.index(self.overlay_scope)
+        except ValueError:
+            i = 0
+        self.overlay_scope = ladder[(i + 1) % len(ladder)]
+        self.show_regions = True
+        label = self.overlay_scope or "auto"
+        print(f"overlay scope: {label}")
+
+    def cycle_overlay_layer(self):
+        """Cycle the overlay layer filter: all → each tag → all. Layers are
+        the distinct tag={...} groups in the resolved overlay (e.g. graticule,
+        starnames). Turns the overlay on so the cycle is visible."""
+        _, shapes = resolve_reg_for(self.curr_path, self.overlay_scope)
+        # Distinct tags, in first-seen order; untagged shapes ignored for cycling.
+        tags = []
+        for sh in shapes:
+            t = sh.get("tag")
+            if t and t not in tags:
+                tags.append(t)
+        if not tags:
+            print("overlay layer: (no tagged layers in this overlay)")
+            self.overlay_layer = None
+            return
+        ladder = [None] + tags
+        try:
+            i = ladder.index(self.overlay_layer)
+        except ValueError:
+            i = 0
+        self.overlay_layer = ladder[(i + 1) % len(ladder)]
+        self.show_regions = True
+        print(f"overlay layer: {self.overlay_layer or 'all'}")
+
     def _draw_regions(self, surf, target):
         """Overlay DS9 .reg shapes (image-pixel coords) on the displayed image.
         `surf` is the source surface; `target` is its blit rect on screen."""
         if not self.curr_path: return
-        shapes = load_reg_for(self.curr_path)
+        scope, shapes = resolve_reg_for(self.curr_path, self.overlay_scope)
+        self._active_overlay_scope = scope   # for the HUD/status line
+        if self.overlay_layer is not None:
+            shapes = [s for s in shapes if s.get("tag") == self.overlay_layer]
         if not shapes: return
         iw, ih = surf.get_size()
         if iw == 0 or ih == 0: return
@@ -1915,6 +2044,20 @@ class Splay:
                 pygame.draw.rect(self.screen, col, rect, 1)
                 if sh["text"]:
                     self._draw_text((rect.x, rect.y - 14), sh["text"], colour=col)
+            elif sh["kind"] == "line":
+                a = px(sh["x1"], sh["y1"])
+                b = px(sh["x2"], sh["y2"])
+                pygame.draw.line(self.screen, col, a, b, 1)
+                if sh["text"]:
+                    mx, my = (a[0] + b[0]) // 2, (a[1] + b[1]) // 2
+                    self._draw_text((mx + 4, my - 8), sh["text"], colour=col)
+            elif sh["kind"] == "polyline":
+                pts = [px(x, y) for (x, y) in sh["pts"]]
+                if len(pts) >= 2:
+                    pygame.draw.lines(self.screen, col, False, pts, 1)
+                if sh["text"] and pts:
+                    self._draw_text((pts[0][0] + 4, pts[0][1] - 8),
+                                    sh["text"], colour=col)
 
     def _draw_status(self):
         sc = self.scope()
@@ -2119,7 +2262,11 @@ class Splay:
             "m / M hot-pixel mask / red-highlight (FITS)",
             "z x   step through pre-generated masks",
             "g     open in GIMP   Del  remove from list",
-            f"o     .reg overlay ({'on' if self.show_regions else 'off'})",
+            f"o/O/^o overlay ({'on' if self.show_regions else 'off'}) "
+            f"scope[{self.overlay_scope or 'auto'}"
+            + (f"→{self._active_overlay_scope}"
+               if self.overlay_scope is None and self._active_overlay_scope else "")
+            + f"] layer[{self.overlay_layer or 'all'}]",
             "L-drag pan when zoomed",
             "q     quit   Esc  minimise   (Ctrl-C also quits)",
         ]
@@ -2593,8 +2740,13 @@ class Splay:
                     elif not self.app and k == pygame.K_g:
                         self.open_in_gimp()
                     elif not self.app and k == pygame.K_o:
-                        self.show_regions = not self.show_regions
-                        print(f"regions: {'on' if self.show_regions else 'off'}")
+                        if mods & pygame.KMOD_CTRL:
+                            self.cycle_overlay_layer()
+                        elif mods & pygame.KMOD_SHIFT:
+                            self.cycle_overlay_scope()
+                        else:
+                            self.show_regions = not self.show_regions
+                            print(f"regions: {'on' if self.show_regions else 'off'}")
                     # App-mode keys
                     elif self.app and k == pygame.K_o:
                         self.cycle_view(+1)
