@@ -21,6 +21,8 @@ Keys (always):
     f           toggle fullscreen (image only — no overlay; HUD via h)
     h           toggle HUD / help
     t           toggle thumbnail strip (off by default; click a thumb to show it)
+    G           toggle grid (contact-sheet) overlay — arrows/PgUp/PgDn/Home/End
+                move the cursor, Enter/click opens that frame, Esc cancels
     r           reload changed / pick up new files in source dirs
     R           toggle auto-reload (rescans once a second; default off)
     0           fit image to window
@@ -678,6 +680,16 @@ class Splay:
         self.show_hud = show_hud
         self.show_strip = show_strip
         self._thumbs_pending = False  # set by _draw_strip when off-screen lookahead remains
+        # Grid (contact-sheet) overlay — a full-viewport page of thumbnails for
+        # browsing large sequences. A mode, not a VIEW_*: it replaces the
+        # single-image display while active. grid_cursor drives navigation;
+        # self.idx is only touched on commit (Enter/click), so Esc cancels
+        # cleanly. grid_cols is recomputed each draw so UP/DOWN key math matches
+        # the rendered layout.
+        self.grid_mode = False
+        self.grid_cursor = 0
+        self.grid_scroll = 0
+        self.grid_cols = 6
         # Set of keys currently physically held. Used to suppress key-repeat
         # KEYDOWN events for keys that should fire once per press (e.g. p,
         # s, d). Only keys in AUTOREPEAT_KEYS are allowed to fire on repeat.
@@ -1804,6 +1816,14 @@ class Splay:
     # ---- drawing ----
     def draw(self):
         self.screen.fill((20, 20, 20))
+        if self.grid_mode:
+            self._draw_grid()
+            if not self.fullscreen:
+                self._draw_status()
+            if self.show_hud:
+                self._draw_hud()
+            pygame.display.flip()
+            return
         if self.app and self.view == VIEW_WIPE:
             self._draw_app_wipe()
         elif self.wipe_on and self.prev_path and self.prev_path != self.curr_path and not self.app:
@@ -2068,6 +2088,125 @@ class Splay:
             return
         self.idx = max(0, min(len(sc) - 1, i))
         self._show_current()
+
+    # ---- grid (contact-sheet) mode ----
+    def toggle_grid(self):
+        """Enter/leave the full-viewport thumbnail grid. On entry we centre on
+        the current frame and pause playback (a churning decode loop behind the
+        grid wastes cycles and ADVANCE_EVENT would fight the cursor)."""
+        self.grid_mode = not self.grid_mode
+        if self.grid_mode:
+            self.playing = False
+            self.grid_cursor = self.idx
+            self._grid_ensure_visible()
+
+    def _grid_geometry(self):
+        """Single source of truth for grid layout, mirrored by _grid_index_at.
+        Cells use the same nominal size as the strip (THUMB_H*2 wide) plus one
+        text line below. Returns (area, cols, rows, cell_w, cell_h)."""
+        area = self.display_area()          # respects the top status bar
+        cell_w = THUMB_H * 2 + 8
+        cell_h = THUMB_H + 20
+        cols = max(1, area.w // cell_w)
+        rows = max(1, area.h // cell_h)
+        return area, cols, rows, cell_w, cell_h
+
+    def _grid_ensure_visible(self):
+        """Scroll the page (in whole rows) so grid_cursor is on-screen."""
+        _, cols, rows, _, _ = self._grid_geometry()
+        per_page = cols * rows
+        if self.grid_cursor < self.grid_scroll:
+            row = self.grid_cursor // cols
+            self.grid_scroll = row * cols
+        elif self.grid_cursor >= self.grid_scroll + per_page:
+            row = self.grid_cursor // cols
+            self.grid_scroll = (row - rows + 1) * cols
+        self.grid_scroll = max(0, self.grid_scroll)
+
+    def grid_move(self, delta):
+        """Move the grid cursor by delta scope-indices (clamped) and rescroll."""
+        sc = self.scope()
+        if not sc:
+            return
+        self.grid_cursor = max(0, min(len(sc) - 1, self.grid_cursor + delta))
+        self._grid_ensure_visible()
+
+    def grid_commit(self):
+        """Leave the grid, showing the frame under the cursor."""
+        self.grid_mode = False
+        self.show_index(self.grid_cursor)
+
+    def _grid_index_at(self, pos):
+        """If screen `pos` is over a grid cell, return its scope index, else
+        None. Reverses _grid_geometry."""
+        sc = self.scope()
+        if not sc:
+            return None
+        area, cols, rows, cell_w, cell_h = self._grid_geometry()
+        mx, my = pos
+        if not area.collidepoint(mx, my):
+            return None
+        col = (mx - area.x) // cell_w
+        row = (my - area.y) // cell_h
+        if col < 0 or col >= cols or row < 0 or row >= rows:
+            return None
+        i = self.grid_scroll + int(row) * cols + int(col)
+        if 0 <= i < len(sc):
+            return i
+        return None
+
+    def _draw_grid(self):
+        """Full-viewport contact sheet over the current scope. Reuses self.thumb
+        and the same per-draw budget discipline as _draw_strip: build only a few
+        cold (expensive FITS) thumbs per frame, placeholder the rest, and set
+        _thumbs_pending so the main loop keeps redrawing until the page fills."""
+        sc = self.scope()
+        area, cols, rows, cell_w, cell_h = self._grid_geometry()
+        self.grid_cols = cols
+        if not sc:
+            self._draw_text((area.x + 10, area.y + 10), "no images",
+                            colour=(220, 100, 100))
+            return
+        per_page = cols * rows
+        start = self.grid_scroll
+        end = min(len(sc), start + per_page)
+        BUILD_BUDGET = 3      # new (cold) thumbs to build per draw
+        self._thumbs_pending = False
+        budget = BUILD_BUDGET
+        for slot, i in enumerate(range(start, end)):
+            p = sc[i]
+            col = slot % cols
+            row = slot // cols
+            x = area.x + col * cell_w
+            y = area.y + row * cell_h
+            t = self.thumbs.get(p)
+            if t is None:
+                # Always build the cursor cell; otherwise spend budget.
+                if i == self.grid_cursor or budget > 0:
+                    t = self.thumb(p)
+                    if i != self.grid_cursor:
+                        budget -= 1
+                else:
+                    self._thumbs_pending = True
+            if t is None:
+                pygame.draw.rect(self.screen, (40, 40, 40),
+                                 (x, y, THUMB_H * 2, THUMB_H), 0)
+                pygame.draw.rect(self.screen, (70, 70, 70),
+                                 (x, y, THUMB_H * 2, THUMB_H), 1)
+                tw, th = THUMB_H * 2, THUMB_H
+            else:
+                tw, th = t.get_size()
+                self.screen.blit(t, (x, y))
+            if i == self.grid_cursor:
+                pygame.draw.rect(self.screen, (255, 200, 0),
+                                 (x - 2, y - 2, tw + 4, th + 4), 2)
+            if p in self.selected:
+                pygame.draw.rect(self.screen, (100, 220, 100),
+                                 (x + tw - 12, y + 2, 10, 10))
+            name = self.display_name(p)
+            if len(name) > 16:
+                name = "…" + name[-15:]
+            self._draw_text((x, y + th + 2), name)
 
     def _draw_hud(self):
         sc = self.scope()
@@ -2419,6 +2558,11 @@ class Splay:
                     self.pan_x += dx
                     self.pan_y += dy
                     self.drag_last = ev.pos
+                elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and self.grid_mode:
+                    gi = self._grid_index_at(ev.pos)
+                    if gi is not None:
+                        self.grid_cursor = gi
+                        self.grid_commit()
                 elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                     ti = self._thumb_index_at(ev.pos)
                     if ti is not None:
@@ -2471,6 +2615,36 @@ class Splay:
                     if k in self._keys_held and k not in AUTOREPEAT_KEYS:
                         continue
                     self._keys_held.add(k)
+                    # Grid mode captures navigation keys before the normal
+                    # handlers. Esc / G cancel (idx unchanged); Enter / Space
+                    # commit to the frame under the cursor. Everything else
+                    # falls through so non-nav keys still work.
+                    if self.grid_mode:
+                        if k in (pygame.K_ESCAPE, pygame.K_g):
+                            self.grid_mode = False
+                            continue
+                        elif k in (pygame.K_RETURN, pygame.K_KP_ENTER,
+                                   pygame.K_SPACE):
+                            self.grid_commit()
+                            continue
+                        elif k == pygame.K_LEFT:
+                            self.grid_move(-1); continue
+                        elif k == pygame.K_RIGHT:
+                            self.grid_move(+1); continue
+                        elif k == pygame.K_UP:
+                            self.grid_move(-self.grid_cols); continue
+                        elif k == pygame.K_DOWN:
+                            self.grid_move(+self.grid_cols); continue
+                        elif k == pygame.K_PAGEUP:
+                            _, cols, rows, _, _ = self._grid_geometry()
+                            self.grid_move(-cols * rows); continue
+                        elif k == pygame.K_PAGEDOWN:
+                            _, cols, rows, _, _ = self._grid_geometry()
+                            self.grid_move(+cols * rows); continue
+                        elif k == pygame.K_HOME:
+                            self.grid_move(-len(self.scope())); continue
+                        elif k == pygame.K_END:
+                            self.grid_move(len(self.scope())); continue
                     if k == pygame.K_ESCAPE:
                         pygame.display.iconify()
                     elif k == pygame.K_q:
@@ -2590,6 +2764,8 @@ class Splay:
                         self._toggle_fullscreen()
                     elif k == pygame.K_DELETE:
                         self.remove_current()
+                    elif k == pygame.K_g and (mods & pygame.KMOD_SHIFT):
+                        self.toggle_grid()   # G: contact-sheet grid overlay
                     elif not self.app and k == pygame.K_g:
                         self.open_in_gimp()
                     elif not self.app and k == pygame.K_o:
