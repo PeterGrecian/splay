@@ -119,12 +119,17 @@ Some settings are guarded and will silently no-op if the precondition isn't met:
 ```json
 {
   "count": 5,
+  "cwd": "/abs/launch/dir",       // working dir splay was launched from
   "paths": ["/abs/path/0001.fits.fz", "..."],
   "source_dirs": ["/abs/dir"],   // dirs splay is watching (for reload)
   "version": 14,
   "writer": "renderer"
 }
 ```
+
+`paths`/`source_dirs` are always absolute (resolved at launch), so the loaded
+set is reproducible without knowing the cwd; `cwd` is recorded anyway so a
+reader can relaunch splay from the same place the user did.
 
 Written whenever the loaded set changes (initial load, reload, IPC `open`,
 `clear`, `Del`). To *add* frames, don't write this file — use the existing IPC

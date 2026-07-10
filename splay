@@ -533,6 +533,13 @@ def _scope_reg_candidates(path, scope):
     first. `day`/`epoch` walk up the directory tree looking for the marker."""
     if path is None:
         return
+    # Resolve to an absolute path so the day/epoch walk-up has a real parent
+    # chain. A relative invocation (splay run from inside the frames dir) would
+    # otherwise only ever check './' and never reach the tree-root _epoch.reg.
+    try:
+        path = path.resolve()
+    except OSError:
+        path = path.absolute()
     if scope == "frame":
         yield path.with_suffix(".reg")
         if path.suffix.lower() == ".fz":          # foo.fits.fz → foo.reg
@@ -620,6 +627,10 @@ def frame_utc(path):
     if path is None:
         return None
     import datetime as _dt
+    try:
+        path = path.resolve()
+    except OSError:
+        path = path.absolute()
     suf = path.suffix.lower()
     if suf in (".fits", ".fit", ".fts", ".fz"):
         try:
@@ -760,6 +771,19 @@ class Splay:
         self._last_fps_print = 0.0
         if not paths:
             sys.exit("no images")
+        # Record the launch working directory and resolve all paths to
+        # absolute up front. splay is often launched with bare relative
+        # filenames from inside a frames dir; keeping paths absolute means the
+        # state files are self-contained (reproducible without the cwd) and the
+        # day/epoch overlay walk-up has a real parent chain to the tree root.
+        self.launch_cwd = pathlib.Path.cwd()
+        def _abs(p):
+            p = pathlib.Path(p)
+            try: return p.resolve()
+            except OSError: return p.absolute()
+        paths = [_abs(p) for p in paths]
+        if source_dirs:
+            source_dirs = [_abs(d) for d in source_dirs]
         # Sort state. Modes: "name" (alphanumeric asc, default), "mtime"
         # (file mtime, newest first), "added" (order splay first saw the
         # path, newest first). _added_seq is a monotonic counter so that
@@ -1290,6 +1314,7 @@ class Splay:
     def _loaded_dict(self):
         return {
             "count": len(self.paths),
+            "cwd": str(self.launch_cwd),
             "paths": [str(p) for p in self.paths],
             "source_dirs": [str(p) for p in self.source_dirs],
             "version": self._state_version,
