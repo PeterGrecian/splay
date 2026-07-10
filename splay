@@ -703,8 +703,12 @@ def overlay_rotation_deg(regpath, path):
     if fu is None:
         return 0.0, wcs
     dt_hr = (fu - wcs["_ref_dt"]).total_seconds() / 3600.0
-    parity = wcs.get("parity", 1.0)
-    return dt_hr * wcs["sidereal_rate"] * parity, wcs
+    # Screen rotation angle. On a y-down image, a +angle rotates CW; the sky
+    # advancing in time should carry the graticule CCW about the pole, so the
+    # angle decreases with time → negative sign. `screen_spin` (default -1)
+    # lets a mirrored/flipped mount override it without re-authoring the .reg.
+    spin = wcs.get("screen_spin", -1.0)
+    return dt_hr * wcs["sidereal_rate"] * spin, wcs
 
 
 def _ensure_np_cv2():
