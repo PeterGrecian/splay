@@ -562,22 +562,138 @@ def _load_reg_cached(regpath):
 def resolve_reg_for(path, forced_scope=None):
     """Resolve the overlay for `path`, most-specific-wins.
 
-    Returns (scope_name, shapes). With forced_scope set, only that scope is
-    consulted (lets the user step down to a broader overlay even when a more
-    specific one exists). Returns (None, []) when nothing is found."""
+    Returns (scope_name, shapes, regpath). `regpath` is the .reg file the
+    shapes came from (so callers can locate a sibling .wcs.json), or None.
+    With forced_scope set, only that scope is consulted. Returns
+    (None, [], None) when nothing is found."""
     if path is None:
-        return (None, [])
+        return (None, [], None)
     scopes = (forced_scope,) if forced_scope else OVERLAY_SCOPES
     for scope in scopes:
         for c in _scope_reg_candidates(path, scope):
             if c.is_file():
-                return (scope, _load_reg_cached(c))
-    return (None, [])
+                return (scope, _load_reg_cached(c), c)
+    return (None, [], None)
 
 
 def load_reg_for(path):
     """Back-compat: shapes for the most-specific overlay of `path`, or []."""
     return resolve_reg_for(path)[1]
+
+
+# ---- Rotated-overlay support -------------------------------------------------
+# Broad-scope overlays (day/epoch) store shapes in a reference orientation
+# (authored at ref_utc). splay rotates them about the sky pole to match the
+# frame being shown: rot_deg = (frame_utc - ref_utc) * sidereal_rate.
+
+_wcs_cache = {}      # regpath -> wcs dict | None
+_frametime_cache = {}  # dirpath -> {index: utc_datetime} | None
+
+
+def load_wcs_sidecar(regpath):
+    """Load `<stem>.wcs.json` beside a .reg (e.g. _epoch.reg → _epoch.wcs.json).
+    Returns dict with pole/ref_utc/sidereal_rate, or None."""
+    if regpath is None:
+        return None
+    key = str(regpath)
+    if key in _wcs_cache:
+        return _wcs_cache[key]
+    cand = regpath.with_suffix(".wcs.json")
+    wcs = None
+    if cand.is_file():
+        try:
+            import json, datetime as _dt
+            d = json.loads(cand.read_text())
+            d["_ref_dt"] = _dt.datetime.fromisoformat(d["ref_utc"])
+            d.setdefault("sidereal_rate", 15.041)  # deg/hr
+            wcs = d
+        except Exception as e:
+            print(f"reg: bad wcs sidecar {cand.name}: {e}", file=sys.stderr)
+    _wcs_cache[key] = wcs
+    return wcs
+
+
+def frame_utc(path):
+    """Best-effort capture UTC for a frame, for overlay rotation.
+    FITS: DATE-OBS header. JPEG sweep frame: per-dir _frametimes.json index
+    map (built from summary.json), else file mtime. Returns datetime or None."""
+    if path is None:
+        return None
+    import datetime as _dt
+    suf = path.suffix.lower()
+    if suf in (".fits", ".fit", ".fts", ".fz"):
+        try:
+            from astropy.io import fits
+            with fits.open(str(path)) as hdul:
+                for hdu in hdul:
+                    do = hdu.header.get("DATE-OBS")
+                    if do:
+                        return _dt.datetime.fromisoformat(do.replace("Z", "+00:00"))
+        except Exception:
+            pass
+    # JPEG (or FITS without DATE-OBS): try a per-dir index→utc map.
+    tmap = _load_frametimes(path.parent)
+    if tmap is not None:
+        m = _re.search(r"(\d+)", path.stem)
+        if m:
+            idx = int(m.group(1))
+            if idx in tmap:
+                return tmap[idx]
+    # Last resort: file mtime.
+    try:
+        return _dt.datetime.fromtimestamp(path.stat().st_mtime, tz=_dt.timezone.utc)
+    except OSError:
+        return None
+
+
+def _load_frametimes(dirpath):
+    """Return {index: utc_datetime} for a sweep-frames dir, or None. Reads a
+    _frametimes.json ({"0": iso, ...}) if present, else derives a linear map
+    from the night's summary.json (first_frame_utc/last_frame_utc + count)."""
+    key = str(dirpath)
+    if key in _frametime_cache:
+        return _frametime_cache[key]
+    import json, datetime as _dt
+    tmap = None
+    ft = dirpath / "_frametimes.json"
+    if ft.is_file():
+        try:
+            raw = json.loads(ft.read_text())
+            tmap = {int(k): _dt.datetime.fromisoformat(v) for k, v in raw.items()}
+        except Exception:
+            tmap = None
+    if tmap is None:
+        # Walk up to a summary.json and interpolate over the frame count in dir.
+        for d in [dirpath, *dirpath.parents]:
+            sj = d / "summary.json"
+            if sj.is_file():
+                try:
+                    s = json.loads(sj.read_text())
+                    t0 = _dt.datetime.fromisoformat(s["first_frame_utc"])
+                    t1 = _dt.datetime.fromisoformat(s["last_frame_utc"])
+                    n = len([p for p in dirpath.glob("*.jpg")]) or 1
+                    tmap = {i: t0 + (t1 - t0) * (i / max(1, n - 1))
+                            for i in range(n)}
+                except Exception:
+                    tmap = None
+                break
+    _frametime_cache[key] = tmap
+    return tmap
+
+
+def overlay_rotation_deg(regpath, path):
+    """Degrees to rotate a broad-scope overlay's shapes about the pole so its
+    reference orientation matches frame `path`. 0.0 if no wcs sidecar or no
+    frame time (i.e. draw unrotated)."""
+    wcs = load_wcs_sidecar(regpath)
+    if not wcs:
+        return 0.0, None
+    fu = frame_utc(path)
+    if fu is None:
+        return 0.0, wcs
+    dt_hr = (fu - wcs["_ref_dt"]).total_seconds() / 3600.0
+    parity = wcs.get("parity", 1.0)
+    return dt_hr * wcs["sidereal_rate"] * parity, wcs
 
 
 def _ensure_np_cv2():
@@ -764,6 +880,7 @@ class Splay:
         # Overlay layer filter: None = show all tags; otherwise only shapes
         # whose tag={...} matches are drawn. Ctrl-o cycles all → each layer.
         self.overlay_layer = None
+        self._overlay_rot_deg = 0.0     # last applied broad-scope rotation
         self.fullscreen = fullscreen
         self.zoom_mode = "fit"   # "fit", "1x", "2x"
         self.pan_x = 0
@@ -1983,7 +2100,7 @@ class Splay:
         """Cycle the overlay layer filter: all → each tag → all. Layers are
         the distinct tag={...} groups in the resolved overlay (e.g. graticule,
         starnames). Turns the overlay on so the cycle is visible."""
-        _, shapes = resolve_reg_for(self.curr_path, self.overlay_scope)
+        _, shapes, _ = resolve_reg_for(self.curr_path, self.overlay_scope)
         # Distinct tags, in first-seen order; untagged shapes ignored for cycling.
         tags = []
         for sh in shapes:
@@ -2007,7 +2124,7 @@ class Splay:
         """Overlay DS9 .reg shapes (image-pixel coords) on the displayed image.
         `surf` is the source surface; `target` is its blit rect on screen."""
         if not self.curr_path: return
-        scope, shapes = resolve_reg_for(self.curr_path, self.overlay_scope)
+        scope, shapes, regpath = resolve_reg_for(self.curr_path, self.overlay_scope)
         self._active_overlay_scope = scope   # for the HUD/status line
         if self.overlay_layer is not None:
             shapes = [s for s in shapes if s.get("tag") == self.overlay_layer]
@@ -2016,8 +2133,27 @@ class Splay:
         if iw == 0 or ih == 0: return
         sx = target.w / iw
         sy = target.h / ih
+        # Broad-scope (day/epoch) overlays are stored sky-fixed at a reference
+        # time; rotate them about the pole to match this frame's hour angle.
+        # A frame-scope overlay is authored for its exact frame — never rotated.
+        rot_deg, wcs = 0.0, None
+        if scope in ("day", "epoch"):
+            rot_deg, wcs = overlay_rotation_deg(regpath, self.curr_path)
+        self._overlay_rot_deg = rot_deg
+        if abs(rot_deg) > 1e-6 and wcs:
+            import math
+            pxp, pyp = wcs["pole"]
+            ca, sa = math.cos(math.radians(rot_deg)), math.sin(math.radians(rot_deg))
+            def rot(x, y):
+                dx, dy = x - pxp, y - pyp
+                return (pxp + dx * ca - dy * sa, pyp + dx * sa + dy * ca)
+        else:
+            def rot(x, y):
+                return (x, y)
         def px(x, y):
+            # Rotate (sky-fixed → this frame) then map image-pixel → screen.
             # DS9 .reg pixel coords are 1-based; pygame is 0-based.
+            x, y = rot(x, y)
             return (int(target.x + (x - 1) * sx),
                     int(target.y + (y - 1) * sy))
         for sh in shapes:
@@ -2266,7 +2402,9 @@ class Splay:
             f"scope[{self.overlay_scope or 'auto'}"
             + (f"→{self._active_overlay_scope}"
                if self.overlay_scope is None and self._active_overlay_scope else "")
-            + f"] layer[{self.overlay_layer or 'all'}]",
+            + f"] layer[{self.overlay_layer or 'all'}]"
+            + (f" rot{self._overlay_rot_deg:+.1f}°"
+               if abs(self._overlay_rot_deg) > 1e-6 else ""),
             "L-drag pan when zoomed",
             "q     quit   Esc  minimise   (Ctrl-C also quits)",
         ]
