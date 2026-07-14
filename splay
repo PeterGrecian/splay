@@ -297,7 +297,16 @@ _cv2 = None
 
 
 def _read_fits_image(path):
-    """Return the first 2-D image HDU's data as float32 ndarray."""
+    """Return the first 2-D image HDU's data as float32 ndarray, presented
+    top-origin (row 0 = top of frame).
+
+    FITS stores rows bottom-up (row 0 = bottom of the sky, DS9's display
+    convention); every other frame type splay handles is top-origin, and the
+    epoch overlay is authored top-origin. So flip Y here — the single point
+    where raw FITS enters splay — and every consumer (render, hot-pixel mask,
+    native_size, probes) then shares one consistent top-origin frame.
+    Absent a ROWORDER header the astronomy default is BOTTOM-UP, which is what
+    our camera writes (no ROWORDER key)."""
     import numpy as np
     from astropy.io import fits
     with fits.open(str(path)) as hdul:
@@ -310,7 +319,7 @@ def _read_fits_image(path):
             raise ValueError(f"{path}: no image HDU found")
     if data.ndim == 3:
         data = data[0]
-    return np.asarray(data, dtype=np.float32)
+    return np.flipud(np.asarray(data, dtype=np.float32))
 
 
 def _apply_hot_pixel_mask(data, mask):
