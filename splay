@@ -1696,6 +1696,12 @@ class Splay:
                 for p in new_paths:
                     try: self.mtimes[p] = p.stat().st_mtime
                     except OSError: pass
+                # In selected-only mode, auto-select fresh arrivals so they
+                # show up alongside the existing selection for comparison. In
+                # list mode, new frames stay unselected (they're already
+                # visible in the full list).
+                if not self.list_mode:
+                    self.selected.update(new_paths)
                 self.paths = self._sort_paths(self.paths + new_paths)
                 self._invalidate_labels()
                 added = len(new_paths)
