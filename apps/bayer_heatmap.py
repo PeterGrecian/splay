@@ -45,20 +45,40 @@ def bayer_channel(ys, xs, pattern="RGGB"):
     return out
 
 
-def assume_white(sub, chan, thresh=0.15):
+def assume_white(sub, chan, thresh=0.15, max_gain=4.0, min_signal=0.05):
     """Scale R,B photosites up to G on the bright (star) patch = assume-white.
 
     Removes the green-dominated checkerboard so the true PSF shows. Returns
     (z, (wb_R, wb_B)). WB ~1.0 means an already-neutral (white) star.
+
+    `sub` is background-subtracted (median removed by the caller), so a channel
+    whose bright-patch mean is ~0 has essentially NO signal. Balancing it means
+    dividing by ~0 -> a giant gain that detonates that channel's noise into
+    false bright pixels (seen on a red star: blue ~empty -> WB Bx447 painted 4
+    huge blue cells). Guard against it two ways:
+      - min_signal: if a channel's bright mean is below this fraction of G, it is
+        genuinely empty (a real colour, e.g. a red star has ~no blue) -> DON'T
+        balance it (gain 1.0), leave it dark rather than amplify noise.
+      - max_gain: never scale by more than this, so even a modestly-weak channel
+        can't blow up. A real neutral star needs gains ~1; only near-empty
+        channels ever hit the cap, and capping them is the correct behaviour.
     """
     br = sub > thresh * sub.max()
-    m = {c: (sub[br & (chan == c)].mean() if (br & (chan == c)).any() else 1.0)
+    m = {c: (sub[br & (chan == c)].mean() if (br & (chan == c)).any() else 0.0)
          for c in "RGB"}
+    g = max(m["G"], 1e-6)
+
+    def gain(c):
+        # genuinely-empty channel (a real colour): don't balance, leave as-is
+        if m[c] < min_signal * g:
+            return 1.0
+        return min(g / m[c], max_gain)
+
+    wr, wb = gain("R"), gain("B")
     z = sub.copy()
-    z[chan == "R"] *= m["G"] / max(m["R"], 1.0)
-    z[chan == "B"] *= m["G"] / max(m["B"], 1.0)
-    return np.clip(z, 0, None), (m["G"] / max(m["R"], 1.0),
-                                 m["G"] / max(m["B"], 1.0))
+    z[chan == "R"] *= wr
+    z[chan == "B"] *= wb
+    return np.clip(z, 0, None), (wr, wb)
 
 
 def render(crop, x0, y0, pattern="RGGB", out="bayer_heatmap.png",

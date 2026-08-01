@@ -51,6 +51,19 @@ Bayer pattern. For a white star Rm≈Gm≈Bm (factors ~1.0) — meaning it's alr
 balanced (a real result: a neutral star). For a coloured star the factors differ.
 Do the balance on the STAR patch, not the sky (sky WB is ~neutral and misleading).
 
+**Cap the gain (critical).** A strongly-coloured star can have a channel that is
+essentially EMPTY — e.g. a red star has ~no blue. Then `Gm/Bm` diverges: on a real
+imx708 red star the naive factor was **B ×447**, which multiplied a few blue noise
+photosites up to 20000–50000 ADU and painted false bright blue cells that swamped
+the real PSF (looked like "4 rogue blue pixels, not a star"). Guard two ways:
+- **min_signal**: if a channel's bright-patch mean is below ~5% of Gm it has no
+  real signal (a genuine colour) — do NOT balance it (gain 1.0), leave it dark
+  rather than amplify its noise.
+- **max_gain ≈ 4**: never scale by more than this. A real neutral star needs
+  gains ~1; only near-empty channels ever hit the cap, and capping is correct.
+Verified: red star -> B ×1.00 (blue left alone, no explosion); neutral star ->
+R ×1.57 B ×1.54 (gentle, both real). The blue-detonation bug is fixed.
+
 ## Reference implementation
 
 See `apps/bayer_heatmap.py` (extracted from the astro scratch). Core:
