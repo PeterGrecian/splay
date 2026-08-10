@@ -28,10 +28,16 @@ Keys (always):
     2           zoomed in (200%)
     3 / 4       FITS auto-stretch: darker / brighter (re-renders from raw)
     p           print pixel at mouse position to stdout: full path +
-                (x,y) + RGB/HSV, plus a "PROBE <path> <x> <y>" line for
-                parsing. Non-modal — each press prints the current pixel.
+                (x,y) + RGB/HSV, plus a machine-readable line
+                  PROBE <path> <x> <y>  RES=WxH  VIEW=<zoom>+<panx>,<pany>
+                for parsing. Non-modal — each press prints the current pixel.
                 ALSO always appended to ~/.splay-probes.log (override with
                 $SPLAY_PROBE_LOG) so positions are readable without piping.
+                <x> <y> are NATIVE full-res source pixels (RES=WxH) — NOT
+                on-screen coords — so a consumer can crop the file directly
+                and must NOT rescale them. VIEW= records the viewport that
+                was on screen (zoom mode + pan offset), which makes the
+                display<->source mapping fully determined either way.
     m           toggle hot-pixel mask (FITS only)
     M           toggle red highlight of hot pixels (FITS only)
     z / x       step backward / forward through sibling masks
@@ -48,7 +54,11 @@ Keys (always):
     Delete      remove current frame from the list (does not touch disk)
     L-drag      pan the image when zoomed (1x / 2x)
     q           quit
-    Esc         minimise window  (Ctrl-C in launching terminal also quits)
+    Esc         minimise window
+
+splay backgrounds itself at launch (the shell prompt comes back; the viewer
+runs on). Pass -fg/--foreground to stay attached — then Ctrl-C in the
+launching terminal also quits.
 
 Keys (in --app mode):
     o           cycle view: input / wipe / output / mask
@@ -2569,7 +2579,8 @@ class Splay:
                   flush=True)
             # Machine-readable line for piping/parsing: PROBE <path> <x> <y>.
             # Coords are NATIVE full-res (RES=WxH), not the on-screen surface.
-            probe_line = f"PROBE {cur} {fx} {fy}"
+            probe_line = (f"PROBE {cur} {fx} {fy}  RES={nw}x{nh}"
+                          f"  VIEW={self.zoom_mode}+{self.pan_x},{self.pan_y}")
             print(probe_line, flush=True)
             # Also ALWAYS append to a fixed log, so probe positions are
             # readable regardless of how splay was launched (no need to
@@ -2590,10 +2601,20 @@ class Splay:
                 # a probe self-sufficient: no re-reading the frame later.
                 cap = _frame_capture_utc(cur)
                 cap_field = f"  CAP={cap}" if cap else ""
+                # VIEW= records the viewport (zoom mode + pan offset) alongside
+                # the native coords. The coords in this line are ALREADY native
+                # full-res, so a reader never needs to invert anything — but
+                # without the viewport recorded, a reader who assumes otherwise
+                # cannot tell, and will "helpfully" rescale them into nonsense.
+                # (2026-08-10: cost a long detour hunting an aircraft at
+                # x=6562 in a 6000-wide frame.) RES + VIEW together make the
+                # display<->source mapping fully determined in both directions.
+                view = f"  VIEW={self.zoom_mode}+{self.pan_x},{self.pan_y}"
                 with open(PROBE_LOG, "a") as _pf:
                     _pf.write(f"{_dt.now().isoformat(timespec='seconds')} "
                               f"PROBE {abs_path} {fx} {fy}  "
-                              f"RES={nw}x{nh}{cap_field}  RGB=({r},{g},{b})\n")
+                              f"RES={nw}x{nh}{view}{cap_field}  "
+                              f"RGB=({r},{g},{b})\n")
             except OSError:
                 pass
 
@@ -2992,6 +3013,21 @@ class Splay:
                     print(f"  {p}")
 
 
+class _UnbreakableWriter:
+    """stdout/stderr wrapper for background mode: after setsid the launching
+    terminal can close under us, turning every print into OSError (EIO) —
+    which would crash the run loop on the next keypress. Swallow those;
+    durable output (pixel probes) goes to the probe log anyway."""
+    def __init__(self, f): self._f = f
+    def write(self, s):
+        try: return self._f.write(s)
+        except OSError: return len(s)
+    def flush(self):
+        try: self._f.flush()
+        except OSError: pass
+    def __getattr__(self, name): return getattr(self._f, name)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="splay — still-image viewer with selection, wipe, "
@@ -3056,6 +3092,11 @@ def main():
     ap.add_argument("--no-autoplay", action="store_true",
                     help="don't auto-start playing on launch. By default, "
                          "splay starts playing a sequence (Space pauses).")
+    ap.add_argument("-fg", "--foreground", action="store_true",
+                    help="stay attached to the shell (Ctrl-C quits). By "
+                         "default splay backgrounds itself once startup "
+                         "checks pass: the prompt comes back and the viewer "
+                         "runs on in its own session.")
     ap.add_argument("--print-fps", action="store_true",
                     help="while playing, print fps + frame index to stdout "
                          "once per second. Useful for headless tests and "
@@ -3111,6 +3152,21 @@ def main():
     # render (get_hot_pixel_mask handles a missing/unreachable file), and
     # sibling discovery is deferred too — so startup never touches the mount.
     mask_path = args.hot_pixel_mask or None
+    # Background by default: everything that fails fast (arg errors, --send,
+    # handoff, app load, path gathering) has already run in the foreground,
+    # so errors land in the shell. Fork now — before pygame init and before
+    # any threads exist — and detach into our own session so terminal Ctrl-C
+    # or closure can't kill the viewer. stdout/stderr stay on the terminal
+    # (prints remain visible while it's open) behind _UnbreakableWriter.
+    if not args.foreground:
+        pid = os.fork()
+        if pid > 0:
+            print(f"splay: backgrounded (pid {pid}); -fg/--foreground to stay attached")
+            return
+        os.setsid()
+        sys.stdin = open(os.devnull)
+        sys.stdout = _UnbreakableWriter(sys.stdout)
+        sys.stderr = _UnbreakableWriter(sys.stderr)
     Splay(paths, app=app, hot_pixel_mask_path=mask_path,
           mask_on=not args.no_mask,
           highlight=args.highlight,
