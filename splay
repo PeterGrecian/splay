@@ -145,6 +145,15 @@ def send_to_running_instance(abs_paths):
     """Try to deliver a list of absolute paths to a running splay."""
     return _send_ipc({"cmd": "open", "paths": abs_paths})
 
+
+def _abs(p):
+    """Resolve to an absolute path. Every path splay keeps (loaded frames and
+    source dirs) goes through here, so reload's `x not in existing` set
+    comparison and the overlay walk-up compare like against like."""
+    p = pathlib.Path(p)
+    try: return p.resolve()
+    except OSError: return p.absolute()
+
 ADVANCE_EVENT = pygame.USEREVENT + 1
 
 # Fixed log that the pixel probe (p key) ALWAYS appends to, so probe
@@ -800,10 +809,6 @@ class Splay:
         # state files are self-contained (reproducible without the cwd) and the
         # day/epoch overlay walk-up has a real parent chain to the tree root.
         self.launch_cwd = pathlib.Path.cwd()
-        def _abs(p):
-            p = pathlib.Path(p)
-            try: return p.resolve()
-            except OSError: return p.absolute()
         paths = [_abs(p) for p in paths]
         if source_dirs:
             source_dirs = [_abs(d) for d in source_dirs]
@@ -1836,10 +1841,18 @@ class Splay:
         new_paths = []
         existing = set(self.paths)
         for s in incoming:
-            p = pathlib.Path(s)
+            p = _abs(s)
             if p.is_dir():
                 if p not in self.source_dirs:
                     self.source_dirs.append(p)
+                # A directory arriving over IPC is the same user intent as
+                # naming one on the command line (`splay ./` handed off to a
+                # running instance), so it turns auto-reload on the same way
+                # the launch default does — otherwise the dir is watched in
+                # principle but the once-a-second scan never runs.
+                if not self.auto_reload:
+                    self.auto_reload = True
+                    print("auto-reload: on (directory opened)")
                 for x in sorted(p.iterdir()):
                     if x.suffix.lower() in IMG_EXTS and x not in existing:
                         new_paths.append(x); existing.add(x)
