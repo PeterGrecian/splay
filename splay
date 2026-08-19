@@ -1,4 +1,4 @@
-#!/home/peter/splay/.venv/bin/python
+#!/usr/bin/env python3
 """splay — still-image viewer with selection, wipe, thumbnail strip, and
 optional image-processing apps loaded from ~/splay/apps/ and ~/.config/splay/apps/.
 
@@ -38,11 +38,6 @@ Keys (always):
                 and must NOT rescale them. VIEW= records the viewport that
                 was on screen (zoom mode + pan offset), which makes the
                 display<->source mapping fully determined either way.
-    m           toggle hot-pixel mask (FITS only)
-    M           toggle red highlight of hot pixels (FITS only)
-    z / x       step backward / forward through sibling masks
-                (siblings = hot-pixels-*.fits.fz next to the seed mask)
-    g           open current frame in GIMP (FITS exported to PNG first)
     o           toggle DS9 .reg overlay (auto-loaded from sidecar).
                 Supports circle/point/box/line/polygon shapes. Overlay is
                 resolved most-specific-wins over a scope ladder:
@@ -73,7 +68,13 @@ Keys (in --app mode):
                 — sidecar is auto-loaded when the image is reopened
 """
 
-import argparse, importlib.util, os, pathlib, sys, copy
+import sys
+
+if any(a in sys.argv[1:] for a in ("-h", "--help")):
+    print(__doc__.strip())
+    sys.exit(0)
+
+import argparse, importlib.util, os, pathlib, copy
 import json, socket, threading
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import time

@@ -12,10 +12,10 @@
 
 set -euo pipefail
 
-usage() {
-    echo "Usage: $0 <input> [-n N] [-o outdir]" >&2
-    exit 1
-}
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+    exit 0
+fi
 
 [ $# -ge 1 ] || usage
 INPUT="$1"; shift
